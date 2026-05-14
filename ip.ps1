@@ -435,21 +435,6 @@ if ($Command -eq "route_del") {
     exit 0
 }
 
-if ($Command -eq "set_ics") {
-    if (-not $AdapterArg -or -not $ThirdArg) {
-        Write-Host "Error: Usage: .\ip.ps1 set_ics <source_adapter> <target_adapter>" -ForegroundColor Red
-        exit 1
-    }
-    
-    if (Set-ICS -SrcAdapter $AdapterArg -TargetAdapter $ThirdArg) {
-        Write-Host "`nICS configured successfully!" -ForegroundColor Green
-    } else {
-        Write-Host "`nFailed to configure ICS" -ForegroundColor Red
-        exit 1
-    }
-    exit 0
-}
-
 function Set-ICS {
     param(
         [string]$SrcAdapter,
@@ -557,6 +542,21 @@ function Set-ICS {
         Write-Host "Error configuring ICS: $_" -ForegroundColor Red
         return $false
     }
+}
+
+if ($Command -eq "set_ics") {
+    if (-not $AdapterArg -or -not $ThirdArg) {
+        Write-Host "Error: Usage: .\ip.ps1 set_ics <source_adapter> <target_adapter>" -ForegroundColor Red
+        exit 1
+    }
+    
+    if (Set-ICS -SrcAdapter $AdapterArg -TargetAdapter $ThirdArg) {
+        Write-Host "`nICS configured successfully!" -ForegroundColor Green
+    } else {
+        Write-Host "`nFailed to configure ICS" -ForegroundColor Red
+        exit 1
+    }
+    exit 0
 }
 
 if (-not $ProfileNum) {
