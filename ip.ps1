@@ -435,6 +435,130 @@ if ($Command -eq "route_del") {
     exit 0
 }
 
+if ($Command -eq "set_ics") {
+    if (-not $AdapterArg -or -not $ThirdArg) {
+        Write-Host "Error: Usage: .\ip.ps1 set_ics <source_adapter> <target_adapter>" -ForegroundColor Red
+        exit 1
+    }
+    
+    if (Set-ICS -SrcAdapter $AdapterArg -TargetAdapter $ThirdArg) {
+        Write-Host "`nICS configured successfully!" -ForegroundColor Green
+    } else {
+        Write-Host "`nFailed to configure ICS" -ForegroundColor Red
+        exit 1
+    }
+    exit 0
+}
+
+function Set-ICS {
+    param(
+        [string]$SrcAdapter,
+        [string]$TargetAdapter
+    )
+    
+    Write-Host "`n=== Configuring ICS: [$SrcAdapter] -> [$TargetAdapter] ===" -ForegroundColor Magenta
+    
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        Write-Host "Error: This command requires administrator privileges" -ForegroundColor Red
+        return $false
+    }
+    
+    # Verify adapters exist
+    $srcAdapterObj = Get-NetAdapter -Name $SrcAdapter -ErrorAction SilentlyContinue
+    if (-not $srcAdapterObj) {
+        Write-Host "Error: Source adapter [$SrcAdapter] not found" -ForegroundColor Red
+        return $false
+    }
+    
+    $targetAdapterObj = Get-NetAdapter -Name $TargetAdapter -ErrorAction SilentlyContinue
+    if (-not $targetAdapterObj) {
+        Write-Host "Error: Target adapter [$TargetAdapter] not found" -ForegroundColor Red
+        return $false
+    }
+    
+    Write-Host "Source adapter: $SrcAdapter" -ForegroundColor Cyan
+    Write-Host "Target adapter: $TargetAdapter" -ForegroundColor Cyan
+    Write-Host ""
+    
+    # Get current ICS configuration
+    $netSharingMgr = New-Object -ComObject HNetCfg.HNetShare
+    
+    try {
+        # Disable any existing sharing first
+        foreach ($connection in $netSharingMgr.EnumEveryConnection) {
+            $netShareCfg = $netSharingMgr.INetSharingConfigurationForINetConnection($connection)
+            $props = $netSharingMgr.NetConnectionProps.INetConnectionProps($connection)
+            
+            if ($netShareCfg.SharingEnabled) {
+                Write-Host "Disabling existing ICS on [$($props.Name)] ..." -ForegroundColor Yellow
+                $netShareCfg.DisableSharing()
+            }
+        }
+        
+        # Enable ICS on source adapter (share out)
+        $srcConnection = $null
+        foreach ($connection in $netSharingMgr.EnumEveryConnection) {
+            $props = $netSharingMgr.NetConnectionProps.INetConnectionProps($connection)
+            if ($props.Name -eq $SrcAdapter) {
+                $srcConnection = $connection
+                break
+            }
+        }
+        
+        if ($srcConnection) {
+            Write-Host "Enabling sharing on source adapter [$SrcAdapter] ..." -ForegroundColor Cyan
+            $netShareCfg = $netSharingMgr.INetSharingConfigurationForINetConnection($srcConnection)
+            $netShareCfg.EnableSharing(0)  # 0 = Private, 1 = Public
+        } else {
+            Write-Host "Warning: Could not find source adapter in ICS configuration" -ForegroundColor Yellow
+        }
+        
+        # Enable ICS on target adapter (share in)
+        $targetConnection = $null
+        foreach ($connection in $netSharingMgr.EnumEveryConnection) {
+            $props = $netSharingMgr.NetConnectionProps.INetConnectionProps($connection)
+            if ($props.Name -eq $TargetAdapter) {
+                $targetConnection = $connection
+                break
+            }
+        }
+        
+        if ($targetConnection) {
+            Write-Host "Enabling sharing on target adapter [$TargetAdapter] ..." -ForegroundColor Cyan
+            $netShareCfg = $netSharingMgr.INetSharingConfigurationForINetConnection($targetConnection)
+            $netShareCfg.EnableSharing(1)  # 0 = Private, 1 = Public
+        } else {
+            Write-Host "Warning: Could not find target adapter in ICS configuration" -ForegroundColor Yellow
+        }
+        
+        # Set static IP on target adapter (192.168.137.1)
+        Write-Host "Setting static IP 192.168.137.1/255.255.255.0 on target adapter [$TargetAdapter] ..." -ForegroundColor Cyan
+        
+        # Clear any conflicts
+        if (-not (Clear-IPConflict -ipToCheck "192.168.137.1" -newIp "192.168.137.10")) {
+            Write-Host "Warning: Could not clear IP conflicts" -ForegroundColor Yellow
+        }
+        
+        $result = netsh interface ip set address $TargetAdapter static 192.168.137.1 255.255.255.0 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Failed to set static IP on target: $result" -ForegroundColor Red
+            return $false
+        }
+        
+        Write-Host ""
+        Write-Host "ICS configured successfully!" -ForegroundColor Green
+        Write-Host "Source adapter: $SrcAdapter" -ForegroundColor Cyan
+        Write-Host "Target adapter: $TargetAdapter" -ForegroundColor Cyan
+        Write-Host "Target IP: 192.168.137.1" -ForegroundColor Cyan
+        
+        return $true
+    } catch {
+        Write-Host "Error configuring ICS: $_" -ForegroundColor Red
+        return $false
+    }
+}
+
 if (-not $ProfileNum) {
     Show-AllAdapters
     Show-RoutingTable
@@ -446,6 +570,7 @@ if (-not $ProfileNum) {
     Write-Host "  .\ip.ps1 route_add <dest> [gateway]    Add static route (requires admin)" -ForegroundColor White
     Write-Host "  .\ip.ps1 route_del <dest>              Delete route (requires admin)" -ForegroundColor White
     Write-Host "  .\ip.ps1 set_profile <1|2> [adapter]  Apply network profile" -ForegroundColor White
+    Write-Host "  .\ip.ps1 set_ics <src> <target>       Configure ICS network sharing (requires admin)" -ForegroundColor White
     Write-Host ""
     Write-Host "  Profile 1: Static IP" -ForegroundColor Cyan
     Write-Host "    IP:   192.168.137.1" -ForegroundColor White
