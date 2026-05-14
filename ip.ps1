@@ -1,6 +1,7 @@
 ﻿param(
     [Parameter()][Alias("a")][string]$Adapter = "eth1",
-    [Parameter()][Alias("p")][string]$Profile
+    [Parameter()][Alias("p")][string]$Profile,
+    [Parameter(Position=0)][string]$Command
 )
 
 $targetAdapter = $Adapter
@@ -73,11 +74,117 @@ function Clear-IPConflict {
     return $true
 }
 
+function Set-FirstAdapter {
+    param($adapterName)
+    
+    Write-Host "=== Setting [$adapterName] as primary network adapter ===" -ForegroundColor Magenta
+    
+    $targetAdapterObj = Get-NetAdapter -Name $adapterName -ErrorAction SilentlyContinue
+    if (-not $targetAdapterObj) {
+        $targetAdapterObj = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { 
+            $_.InterfaceAlias -eq $adapterName -or 
+            $_.InterfaceDescription -match [regex]::Escape($adapterName) -or
+            $_.Name -eq $adapterName 
+        } | Select-Object -First 1
+    }
+    
+    if (-not $targetAdapterObj) {
+        Write-Host "  Error: Adapter [$adapterName] not found!" -ForegroundColor Red
+        return $false
+    }
+    
+    $targetAlias = $targetAdapterObj.InterfaceAlias
+    Write-Host "  Found adapter: [$targetAlias]" -ForegroundColor Cyan
+    
+    $gateways = Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.DestinationPrefix -eq "0.0.0.0/0" }
+    
+    if (-not $gateways) {
+        Write-Host "  Error: No default gateway found!" -ForegroundColor Red
+        return $false
+    }
+    
+    $targetGateway = $gateways | Where-Object { $_.InterfaceAlias -eq $targetAlias }
+    if (-not $targetGateway) {
+        Write-Host "  Error: No default gateway found for adapter [$targetAlias]" -ForegroundColor Red
+        return $false
+    }
+    
+    Write-Host ""
+    Write-Host "  Current default gateways:" -ForegroundColor Yellow
+    foreach ($gw in $gateways | Sort-Object -Property RouteMetric) {
+        Write-Host "    $($gw.NextHop) dev $($gw.InterfaceAlias) metric $($gw.RouteMetric)"
+    }
+    
+    $minMetric = ($gateways.RouteMetric | Measure-Object -Minimum).Minimum
+    $newTargetMetric = 10
+    $otherMetric = 200
+    
+    Write-Host ""
+    Write-Host "  Setting [$targetAlias] gateway priority to highest..." -ForegroundColor Cyan
+    
+    foreach ($gw in $gateways) {
+        if ($gw.InterfaceAlias -eq $targetAlias) {
+            if ($gw.RouteMetric -ne $newTargetMetric) {
+                Write-Host "    Updating [$targetAlias] metric from $($gw.RouteMetric) to $newTargetMetric..." -ForegroundColor Gray
+                try {
+                    Set-NetRoute -InterfaceAlias $targetAlias -DestinationPrefix "0.0.0.0/0" -NextHop $gw.NextHop -RouteMetric $newTargetMetric -ErrorAction Stop
+                    Write-Host "    Successfully updated [$targetAlias] metric to $newTargetMetric" -ForegroundColor Green
+                } catch {
+                    Write-Host "    Failed to update [$targetAlias] metric: $_" -ForegroundColor Red
+                    return $false
+                }
+            } else {
+                Write-Host "    [$targetAlias] already has highest priority (metric $newTargetMetric)" -ForegroundColor Gray
+            }
+        } else {
+            if ($gw.RouteMetric -lt $otherMetric) {
+                Write-Host "    Lowering [$($gw.InterfaceAlias)] metric from $($gw.RouteMetric) to $otherMetric..." -ForegroundColor Gray
+                try {
+                    Set-NetRoute -InterfaceAlias $gw.InterfaceAlias -DestinationPrefix "0.0.0.0/0" -NextHop $gw.NextHop -RouteMetric $otherMetric -ErrorAction Stop
+                    Write-Host "    Successfully lowered [$($gw.InterfaceAlias)] metric to $otherMetric" -ForegroundColor Green
+                } catch {
+                    Write-Host "    Failed to update [$($gw.InterfaceAlias)] metric: $_" -ForegroundColor Red
+                }
+            }
+        }
+    }
+    
+    Write-Host ""
+    Write-Host "  Updated default gateways:" -ForegroundColor Yellow
+    $updatedGateways = Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.DestinationPrefix -eq "0.0.0.0/0" } | Sort-Object -Property RouteMetric
+    foreach ($gw in $updatedGateways) {
+        Write-Host "    $($gw.NextHop) dev $($gw.InterfaceAlias) metric $($gw.RouteMetric)"
+    }
+    
+    return $true
+}
+
+if ($Command -eq "set_first") {
+    if (-not $Adapter) {
+        Write-Host "Error: Adapter name is required for set_first command!" -ForegroundColor Red
+        Write-Host "Usage: .\ip.ps1 set_first <adapter_name>" -ForegroundColor Yellow
+        exit 1
+    }
+    
+    if (Set-FirstAdapter -adapterName $Adapter) {
+        Write-Host ""
+        Write-Host "Done!" -ForegroundColor Green
+    } else {
+        Write-Host ""
+        Write-Host "Failed to set [$Adapter] as primary adapter" -ForegroundColor Red
+        exit 1
+    }
+    exit 0
+}
+
 if (-not $Profile) {
     Show-AllAdapters
     Show-RoutingTable
     Write-Host ""
-    Write-Host "Usage: .\ip.ps1 -Adapter <name> -Profile <1|2>" -ForegroundColor Yellow
+    Write-Host "Usage:" -ForegroundColor Yellow
+    Write-Host "  .\ip.ps1" -ForegroundColor White
+    Write-Host "  .\ip.ps1 -Adapter <name> -Profile <1|2>" -ForegroundColor White
+    Write-Host "  .\ip.ps1 set_first <adapter_name>" -ForegroundColor White
     Write-Host ""
     Write-Host "  -Adapter:  Network adapter name (default: eth1)" -ForegroundColor White
     Write-Host ""
@@ -89,6 +196,10 @@ if (-not $Profile) {
     Write-Host "  Profile 2: DHCP + Custom DNS" -ForegroundColor Cyan
     Write-Host "    IP:   DHCP" -ForegroundColor White
     Write-Host "    DNS:  176.16.98.100" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  set_first: Set adapter as primary (highest routing priority)" -ForegroundColor Cyan
+    Write-Host "    Example: .\ip.ps1 set_first eth0" -ForegroundColor White
+    Write-Host "    Example: .\ip.ps1 set_first ""WiFi网络""" -ForegroundColor White
     exit 0
 }
 

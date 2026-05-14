@@ -8,6 +8,7 @@ Windows网络配置管理PowerShell脚本。
 - 显示路由表和默认网关
 - 两种IP配置模式：静态IP和DHCP+自定义DNS
 - IP冲突自动处理
+- 设置默认路由优先级（set_first命令）
 
 ## 系统要求
 
