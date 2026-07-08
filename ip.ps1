@@ -2,12 +2,132 @@
     [Parameter(Position=0)][string]$Command,
     [Parameter(Position=1)][string]$AdapterArg,
     [Parameter(Position=2)][string]$ThirdArg,
+    [Parameter(Position=3)][string]$FourthArg,
     [Parameter()][Alias("p")][string]$ProfileNum
 )
+
+# 定义 Trace-Route 函数（必须在命令处理逻辑之前）
+function Trace-Route {
+    param(
+        [string]$Target,
+        [string]$Description = "目标主机",
+        [string]$Gateway = ""
+    )
+    
+    Write-Host "`n=== 网络路由追踪 (Traceroute) ===" -ForegroundColor Magenta
+    
+    # 检查 tracert 是否可用（需要管理员权限）
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    
+    if (-not $isAdmin) {
+        Write-Host "⚠️  注意：tracert 需要管理员权限才能显示完整的路由信息" -ForegroundColor Yellow
+        Write-Host ""
+    }
+    
+    # 使用 PowerShell 内置的 Test-NetPathConnection 进行路由追踪（不需要管理员）
+    Write-Host "`n=== 使用 PowerShell 网络测试 (替代 tracert) ===" -ForegroundColor Cyan
+    
+    if ($Gateway) {
+        Write-Host "Testing connectivity to $Target via gateway $Gateway ... " -NoNewline
+        try {
+            # 显示 DNS 解析信息
+            Write-Host "`nDNS 解析:" -ForegroundColor Gray
+            $resolved = Resolve-DnsName -Name $Target -Type A -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($resolved) {
+                Write-Host "  $($resolved.Name) -> $($resolved.AddressString)" -ForegroundColor Gray
+            } else {
+                Write-Host "  DNS 解析失败" -ForegroundColor Yellow
+            }
+            
+            # 测试网络连通性
+            Write-Host "`n网络测试:" -ForegroundColor Gray
+            $pingResult = Test-NetConnection -ComputerName $Target -Port 80 -InformationLevel Detailed
+            if ($pingResult) {
+                Write-Host "✓ 目标地址：$($pingResult.RemoteAddress)" -ForegroundColor Green
+                Write-Host "  状态：$($pingResult.Status)" -ForegroundColor Gray
+                Write-Host "  往返时间：${($pingResult.RoundTripTime)}ms" -ForegroundColor Gray
+            } else {
+                Write-Host "✗ 无法连接到目标" -ForegroundColor Red
+            }
+            
+            # 显示路由信息（如果可用）
+            try {
+                $route = Get-NetRoute -DestinationPrefix $Target -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($route) {
+                    Write-Host "`n路由信息:" -ForegroundColor Gray
+                    Write-Host "  目标：$($route.DestinationPrefix)/$($route.PrefixLength)" -ForegroundColor Gray
+                    Write-Host "  网关：$($route.NextHop)" -ForegroundColor Gray
+                    Write-Host "  接口：$($route.InterfaceAlias)" -ForegroundColor Gray
+                } else {
+                    Write-Host "`n未找到特定路由（使用默认网关）" -ForegroundColor Yellow
+                }
+            } catch {}
+            
+        } catch {
+            Write-Host "✗ 测试失败：$_" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "Testing connectivity to $Target ... " -NoNewline
+        try {
+            # 显示 DNS 解析信息
+            Write-Host "`nDNS 解析:" -ForegroundColor Gray
+            $resolved = Resolve-DnsName -Name $Target -Type A -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($resolved) {
+                Write-Host "  $($resolved.Name) -> $($resolved.AddressString)" -ForegroundColor Gray
+            } else {
+                Write-Host "  DNS 解析失败" -ForegroundColor Yellow
+            }
+            
+            # 测试网络连通性
+            Write-Host "`n网络测试:" -ForegroundColor Gray
+            $pingResult = Test-NetConnection -ComputerName $Target -Port 80 -InformationLevel Detailed
+            if ($pingResult) {
+                Write-Host "✓ 目标地址：$($pingResult.RemoteAddress)" -ForegroundColor Green
+                Write-Host "  状态：$($pingResult.Status)" -ForegroundColor Gray
+                Write-Host "  往返时间：${($pingResult.RoundTripTime)}ms" -ForegroundColor Gray
+                
+                # 显示路由信息（如果可用）
+                try {
+                    $route = Get-NetRoute -DestinationPrefix $Target -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($route) {
+                        Write-Host "`n路由信息:" -ForegroundColor Gray
+                        Write-Host "  目标：$($route.DestinationPrefix)/$($route.PrefixLength)" -ForegroundColor Gray
+                        Write-Host "  网关：$($route.NextHop)" -ForegroundColor Gray
+                        Write-Host "  接口：$($route.InterfaceAlias)" -ForegroundColor Gray
+                    } else {
+                        Write-Host "`n未找到特定路由（使用默认网关）" -ForegroundColor Yellow
+                    }
+                } catch {}
+            } else {
+                Write-Host "✗ 无法连接到目标" -ForegroundColor Red
+            }
+            
+        } catch {
+            Write-Host "✗ 测试失败：$_" -ForegroundColor Red
+        }
+    }
+}
 
 if ($Command -eq "set_profile") {
     $ProfileNum = $AdapterArg
     $targetAdapter = $ThirdArg
+} elseif ($Command -eq "trace_route") {
+    $target = $AdapterArg
+    Trace-Route -Target $target
+    exit 0
+} elseif ($Command -eq "set_ip") {
+    if (-not $AdapterArg -or -not $ThirdArg) {
+        Write-Host "Error: Usage: .\ip.ps1 set_ip <adapter> <ip_address> [mask]" -ForegroundColor Red
+        exit 1
+    }
+    
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        Write-Host "Warning: This command requires administrator privileges" -ForegroundColor Yellow
+    }
+    
+    Set-StaticIP -Adapter $AdapterArg -IPAddress $ThirdArg -Mask $FourthArg
+    exit 0
 } elseif ($ProfileNum -and $Command -ne "" -and $AdapterArg -eq "") {
     $targetAdapter = $Command
 } elseif ($Command -eq "-p" -or $Command -eq "p") {
@@ -28,30 +148,75 @@ function Show-AllAdapters {
         $linkStatus = if ($adapter.Status -eq "Up") { "up" } else { "down" }
         $linkSpeed = if ($adapter.LinkSpeed) { $adapter.LinkSpeed } else { "N/A" }
         
+        # 直接使用 Get-NetAdapter 的 Description（更可靠）
+        $description = $adapter.Description
+        # 如果为空，尝试通过 WMI 查询（使用 InterfaceAlias 匹配）
+        if (-not $description) {
+            $wmiDesc = Get-WmiObject -Class Win32_NetworkAdapter | Where-Object { $_.NetConnectionID -eq $alias } | Select-Object -First 1
+            if ($wmiDesc) {
+                $description = $wmiDesc.Description
+            }
+        }
+        
         $ipConfig = Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue
         $dns = Get-DnsClientServerAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue
         $ipInterface = Get-NetIPInterface -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue
         $dhcp = $ipInterface.Dhcp
+        
+        # 获取 MAC 地址
+        $macAddress = $adapter.MacAddress
+        
+        # 获取 IPv4 默认网关
+        $gateway = Get-NetRoute -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.DestinationPrefix -eq "0.0.0.0/0" } | Select-Object -First 1
 
         $isApipa = $ipConfig -and $ipConfig.IPAddress -like "169.254.*.*"
         $hasValidIp = $ipConfig -and -not $isApipa
         
-        $statusColor = if ($hasValidIp) { "Green" } elseif ($isApipa) { "Yellow" } elseif ($linkStatus -eq "up") { "White" } else { "Gray" }
-        $ipStatus = if ($hasValidIp) { "valid IP" } elseif ($isApipa) { "APIPA (no DHCP)" } elseif ($ipConfig) { "no DHCP" } else { "no IP" }
-
+        # 第一行：适配器名 + 状态（用颜色区分）
         Write-Host ""
-        Write-Host "  [$alias]" -NoNewline
-        Write-Host " $adminStatus, $linkStatus, $linkSpeed" -ForegroundColor Cyan
-
+        Write-Host "[$alias]" -NoNewline
+        $statusColor = if ($linkStatus -eq "up") { "Green" } else { "Red" }
+        Write-Host " $adminStatus, $linkStatus, $linkSpeed" -ForegroundColor $statusColor
         
-        if ($ipConfig) {
-            Write-Host "    IPv4: $($ipConfig.IPAddress)/$($ipConfig.PrefixLength)" -ForegroundColor $(if ($hasValidIp) { "Cyan" } else { "Gray" })
-        } else {
-            Write-Host "    IPv4: (none)" -ForegroundColor Gray
+        # 第二行：描述信息
+        if ($description) {
+            Write-Host "  ($description)" -ForegroundColor Gray
         }
-        Write-Host "    DHCP: $dhcp"
+        
+        # 第三行：MAC 地址（清理格式）
+        if ($macAddress) {
+            $cleanMac = $macAddress -replace '--', '-' -replace '-+', '-'
+            Write-Host "     MAC: $cleanMac" -ForegroundColor Gray
+        }
+        
+        # 第四行：IPv4 地址 + 状态（合并到一行）
+        if ($ipConfig) {
+            $ipStatus = if ($hasValidIp) { "" } elseif ($isApipa) { "   (APIPA, no DHCP)" } else { "   (no DHCP)" }
+            $ipColor = if ($hasValidIp) { "Cyan" } elseif ($isApipa) { "Yellow" } else { "Gray" }
+            Write-Host "     IPv4: $($ipConfig.IPAddress)/$($ipConfig.PrefixLength)$ipStatus" -ForegroundColor $ipColor
+            
+
+        } else {
+            Write-Host "     IPv4: (none)" -ForegroundColor Gray
+
+        }
+        # 根据 IP 状态显示 DHCP（APIPA 表示 DHCP 失败）
+        if ($isApipa) {
+            Write-Host "     DHCP: failed to APIPA" -ForegroundColor Yellow
+        } elseif (-not $dhcp -or $dhcp -eq "Disabled") {
+            Write-Host "     DHCP: Disabled" -ForegroundColor Gray
+        } else {
+            Write-Host "     DHCP: Enabled" -ForegroundColor Green
+        }
+
+        # 第五行：Gateway（如果有）
+        if ($gateway -and $gateway.NextHop -ne "0.0.0.0") {
+            Write-Host "     Gateway: $($gateway.NextHop)" -ForegroundColor Green
+        }
+        
+        # 第七行：DNS（如果有）
         if ($dns.ServerAddresses -and $dns.ServerAddresses[0] -ne "0.0.0.0") {
-            Write-Host "    DNS:  $($dns.ServerAddresses -join ', ')" -ForegroundColor Green
+            Write-Host "     DNS:  $($dns.ServerAddresses -join ', ')" -ForegroundColor Green
         }
         
         $ipConfigV6 = Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv6 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -ne "WellKnown" }
@@ -562,27 +727,24 @@ function Set-ICS {
 if (-not $ProfileNum) {
     Show-AllAdapters
     Show-RoutingTable
+    
     Write-Host "`n========================================" -ForegroundColor Magenta
     Write-Host "Usage:" -ForegroundColor Yellow
     Write-Host "  .\ip.ps1                              Show all network info" -ForegroundColor White
     Write-Host "  .\ip.ps1 ping [target]                Test network connectivity" -ForegroundColor White
     Write-Host "  .\ip.ps1 set_first <adapter>          Set adapter as primary (requires admin)" -ForegroundColor White
-    Write-Host "  .\ip.ps1 route_add <dest> [gateway]    Add static route (requires admin)" -ForegroundColor White
-    Write-Host "  .\ip.ps1 route_del <dest>              Delete route (requires admin)" -ForegroundColor White
-    Write-Host "  .\ip.ps1 set_profile <1|2> [adapter]  Apply network profile" -ForegroundColor White
-    Write-Host "  .\ip.ps1 set_ics <src> <target>       Configure ICS network sharing (requires admin)" -ForegroundColor White
+    Write-Host "  .\ip.ps1 route_add <dest> [gateway]   Add static route (requires admin)" -ForegroundColor White
+    Write-Host "  .\ip.ps1 route_del <dest>             Delete route (requires admin)" -ForegroundColor White
+    Write-Host "  .\ip.ps1 set_profile <1|2|3> [adapter] Apply network profile" -ForegroundColor White
+    Write-Host "  .\ip.ps1 trace_route <target>         Trace route to target" -ForegroundColor White
+    Write-Host "  .\ip.ps1 set_ip <adapter> <ip> [mask] Set static IP freely (requires admin)" -ForegroundColor White
     Write-Host ""
-    Write-Host "  Profile 1: Static IP" -ForegroundColor Cyan
-    Write-Host "    IP:   192.168.137.1" -ForegroundColor White
-    Write-Host "    Mask: 255.255.255.0" -ForegroundColor White
-    Write-Host "    DNS:  DHCP" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  Profile 2: DHCP + Custom DNS" -ForegroundColor Cyan
-    Write-Host "    IP:   DHCP" -ForegroundColor White
-    Write-Host "    DNS:  176.16.98.100" -ForegroundColor White
+    Write-Host "Profiles:" -ForegroundColor Cyan
+    Write-Host "  Profile 1: Static IP (192.168.137.1/24, DHCP DNS)" -ForegroundColor Gray
+    Write-Host "  Profile 2: DHCP + Custom DNS (176.16.98.100)" -ForegroundColor Gray
+    Write-Host "  Profile 3: Static IP (192.168.50.11/24) with Gateway (192.168.50.1)" -ForegroundColor Gray
     exit 0
 }
-
 $profile = $ProfileNum
 $hasError = $false
 $targetIp = "192.168.137.1"
@@ -631,9 +793,31 @@ if ($profile -eq "1") {
         $hasError = $true
     }
 
+} elseif ($profile -eq "3") {
+    $targetIp = "192.168.50.11"
+    $gateway = "192.168.50.1"
+    Write-Host "Profile 3: Setting [$targetAdapter] to static IP: $targetIp/24 with Gateway: $gateway ..." -ForegroundColor Cyan
+
+    if (-not (Clear-IPConflict -ipToCheck $targetIp -newIp "192.168.50.11")) {
+        Write-Host "  Warning: IP conflict detected" -ForegroundColor Yellow
+    }
+
+    Write-Host "  Setting [$targetAdapter] IP to static $targetIp/24 ..." -ForegroundColor Gray
+    $result = netsh interface ip set address name=$targetAdapter static $targetIp 255.255.255.0 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  Failed: $result" -ForegroundColor Red
+        $hasError = $true
+    }
+
+    Write-Host "  Setting [$targetAdapter] Gateway to $gateway ..." -ForegroundColor Gray
+    netsh interface ip set route name=$targetAdapter gateway=$gateway persist 2>&1 | Out-Null
 } else {
     Write-Host "Unknown profile: $profile" -ForegroundColor Red
-    Write-Host "Usage: .\ip.ps1 -p <1|2> [adapter]" -ForegroundColor Yellow
+    Write-Host "Usage: .\ip.ps1 -p <1|2|3> [adapter]" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  Profile 1: Static IP (192.168.137.1/24)" -ForegroundColor Gray
+    Write-Host "  Profile 2: DHCP + Custom DNS (176.16.98.100)" -ForegroundColor Gray
+    Write-Host "  Profile 3: Static IP (192.168.50.11/24) with Gateway (192.168.50.1)" -ForegroundColor Gray
     exit 1
 }
 
@@ -644,6 +828,8 @@ if (-not $hasError) {
     exit 1
 }
 
-Write-Host ""
-Show-AllAdapters
-Show-RoutingTable
+
+
+
+
+

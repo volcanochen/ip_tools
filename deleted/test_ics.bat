@@ -1,0 +1,6 @@
+@echo off
+echo Running ICS test...
+powershell -ExecutionPolicy Bypass -File "%~dp0ip.ps1" set_ics "wifi网络" "eth0"
+echo.
+echo Press any key to exit...
+pause > nul
