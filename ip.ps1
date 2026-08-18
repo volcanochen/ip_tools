@@ -3,7 +3,10 @@
     [Parameter(Position=1)][string]$AdapterArg,
     [Parameter(Position=2)][string]$ThirdArg,
     [Parameter(Position=3)][string]$FourthArg,
-    [Parameter()][Alias("p")][string]$ProfileNum
+    [Parameter()][Alias("p")][string]$ProfileNum,
+    [Parameter()][Alias("d")][string]$NatDest,
+    [Parameter()][switch]$Persist,
+    [Parameter()][Alias("dev")][string]$DevInterface
 )
 
 # 定义 Trace-Route 函数（必须在命令处理逻辑之前）
@@ -319,12 +322,32 @@ function Test-NetworkConnectivity {
     }
 }
 
+function Convert-SubnetMaskToPrefixLength {
+    param([string]$Mask)
+    
+    # If already a number (prefix length), return it
+    if ($Mask -match '^\d+$') {
+        return [int]$Mask
+    }
+    
+    # Convert subnet mask to prefix length
+    $octets = $Mask.Split('.')
+    if ($octets.Count -ne 4) {
+        return 32  # Default to /32 if invalid
+    }
+    
+    $binary = ($octets | ForEach-Object { [Convert]::ToString($_, 2).PadLeft(8, '0') }) -join ''
+    $prefixLength = ($binary.ToCharArray() | Where-Object { $_ -eq '1' }).Count
+    return $prefixLength
+}
+
 function Add-StaticRoute {
     param(
         [string]$Destination,
         [string]$Mask = "255.255.255.255",
         [string]$Gateway,
-        [string]$InterfaceIndex
+        [string]$InterfaceName,
+        [int]$InterfaceIndex
     )
     
     if (-not $Gateway) {
@@ -336,12 +359,96 @@ function Add-StaticRoute {
         $Gateway = $gateway
     }
     
-    Write-Host "Adding route: $Destination/$Mask via $Gateway" -ForegroundColor Cyan
-    try {
-        if ($InterfaceIndex) {
-            New-NetRoute -DestinationPrefix "$Destination/$Mask" -NextHop $Gateway -InterfaceIndex $InterfaceIndex -RouteMetric 10 -ErrorAction Stop
+    # Convert subnet mask to prefix length
+    $prefixLength = Convert-SubnetMaskToPrefixLength -Mask $Mask
+    $destinationPrefix = "$Destination/$prefixLength"
+    
+    # Resolve interface: -InterfaceName takes priority, then -InterfaceIndex, then auto-detect
+    $ifIndex = 0
+    if ($InterfaceName) {
+        # User specified interface by name (e.g., "eth0", "Ethernet")
+        $adapter = Get-NetAdapter -Name $InterfaceName -ErrorAction SilentlyContinue
+        if (-not $adapter) {
+            # Try matching by InterfaceAlias or InterfaceDescription
+            $adapter = Get-NetAdapter | Where-Object { $_.InterfaceAlias -eq $InterfaceName -or $_.InterfaceDescription -like "*$InterfaceName*" } | Select-Object -First 1
+        }
+        if (-not $adapter) {
+            Write-Host "Error: Interface '$InterfaceName' not found" -ForegroundColor Red
+            Write-Host "Available interfaces:" -ForegroundColor Yellow
+            Get-NetAdapter | Format-Table Name, InterfaceDescription, Status -AutoSize
+            return $false
+        }
+        $ifIndex = $adapter.ifIndex
+        Write-Host "Using interface: [$($adapter.Name)] (ifIndex $ifIndex)" -ForegroundColor Green
+    } elseif ($InterfaceIndex) {
+        $ifIndex = $InterfaceIndex
+    } else {
+        # Auto-detect: find which interface can reach the gateway
+        # Try to find the route to the gateway first
+        $gatewayRoute = Get-NetRoute -DestinationPrefix "$Gateway/32" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $gatewayRoute) {
+            # Try finding by network: check which interface's subnet contains the gateway
+            $adapters = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -ne "127.0.0.1" }
+            foreach ($adapter in $adapters) {
+                $adapterIP = $adapter.IPAddress
+                $prefix = $adapter.PrefixLength
+                # Get the network address for this adapter's subnet
+                $adapterIfIndex = $adapter.InterfaceIndex
+                # Check if gateway is in the same subnet as this adapter
+                $routeCheck = Get-NetRoute -InterfaceIndex $adapterIfIndex -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq $Gateway }
+                if ($routeCheck) {
+                    $ifIndex = $adapterIfIndex
+                    $ifAlias = (Get-NetAdapter -InterfaceIndex $ifIndex -ErrorAction SilentlyContinue).Name
+                    Write-Host "Auto-detected interface: [$ifAlias] (ifIndex $ifIndex)" -ForegroundColor Green
+                    break
+                }
+            }
+            if (-not $ifIndex) {
+                # Fallback: find which interface has an IP in the same subnet as the gateway
+                foreach ($adapter in $adapters) {
+                    $adapterIP = $adapter.IPAddress
+                    $prefix = $adapter.PrefixLength
+                    # Parse IP and gateway to check if same subnet
+                    $adapterBytes = [System.Net.IPAddress]::Parse($adapterIP).GetAddressBytes()
+                    $gatewayBytes = [System.Net.IPAddress]::Parse($Gateway).GetAddressBytes()
+                    $maskBytes = ([math]::Pow(2, $prefix) - 1)
+                    # Simple check: same first 3 octets for /24
+                    if ($prefix -le 24) {
+                        if ($adapterIP.Split('.')[0..2] -join '.' -eq $Gateway.Split('.')[0..2] -join '.') {
+                            $ifIndex = $adapter.InterfaceIndex
+                            $ifAlias = (Get-NetAdapter -InterfaceIndex $ifIndex -ErrorAction SilentlyContinue).Name
+                            Write-Host "Auto-detected interface: [$ifAlias] (ifIndex $ifIndex)" -ForegroundColor Green
+                            break
+                        }
+                    }
+                }
+            }
         } else {
-            New-NetRoute -DestinationPrefix "$Destination/$Mask" -NextHop $Gateway -RouteMetric 10 -ErrorAction Stop
+            $ifIndex = $gatewayRoute.InterfaceIndex
+            $ifAlias = (Get-NetAdapter -InterfaceIndex $ifIndex -ErrorAction SilentlyContinue).Name
+            Write-Host "Auto-detected interface: [$ifAlias] (ifIndex $ifIndex)" -ForegroundColor Green
+        }
+        if (-not $ifIndex) {
+            Write-Host "Warning: Could not auto-detect interface for gateway $Gateway" -ForegroundColor Yellow
+            Write-Host "Available interfaces:" -ForegroundColor Yellow
+            Get-NetAdapter | Format-Table Name, InterfaceDescription, Status -AutoSize
+        }
+    }
+    
+    Write-Host "Adding route: $destinationPrefix via $Gateway" -ForegroundColor Cyan
+    try {
+        # Check if route already exists
+        $existingRoute = Get-NetRoute -DestinationPrefix $destinationPrefix -ErrorAction SilentlyContinue
+        if ($existingRoute) {
+            Write-Host "Route already exists, removing old route..." -ForegroundColor Yellow
+            Remove-NetRoute -DestinationPrefix $destinationPrefix -Confirm:$false -ErrorAction Stop
+            Start-Sleep -Milliseconds 500
+        }
+        
+        if ($ifIndex) {
+            New-NetRoute -DestinationPrefix $destinationPrefix -NextHop $Gateway -InterfaceIndex $ifIndex -RouteMetric 10 -ErrorAction Stop
+        } else {
+            New-NetRoute -DestinationPrefix $destinationPrefix -NextHop $Gateway -RouteMetric 10 -ErrorAction Stop
         }
         Write-Host "Route added successfully" -ForegroundColor Green
         return $true
@@ -356,11 +463,14 @@ function Remove-StaticRoute {
         [string]$Destination
     )
     
-    Write-Host "Removing route: $Destination" -ForegroundColor Cyan
+    # Convert bare IP to CIDR format (/32 if no prefix specified)
+    $destinationPrefix = if ($Destination -match '/') { $Destination } else { "$Destination/32" }
+    
+    Write-Host "Removing route: $destinationPrefix" -ForegroundColor Cyan
     try {
-        $route = Get-NetRoute -DestinationPrefix $Destination -ErrorAction SilentlyContinue
+        $route = Get-NetRoute -DestinationPrefix $destinationPrefix -ErrorAction SilentlyContinue
         if ($route) {
-            Remove-NetRoute -DestinationPrefix $Destination -Confirm:$false -ErrorAction Stop
+            Remove-NetRoute -DestinationPrefix $destinationPrefix -Confirm:$false -ErrorAction Stop
             Write-Host "Route removed successfully" -ForegroundColor Green
         } else {
             Write-Host "Route not found" -ForegroundColor Yellow
@@ -563,14 +673,14 @@ if ($Command -eq "route_add") {
     }
     
     if (-not $AdapterArg) {
-        Write-Host "Error: Usage: .\ip.ps1 route_add <destination> [gateway]" -ForegroundColor Red
+        Write-Host "Error: Usage: .\ip.ps1 route_add <destination> [gateway] [-dev <interface>]" -ForegroundColor Red
         exit 1
     }
     
     $destination = $AdapterArg
-    $gateway = $ProfileNum
+    $gateway = $ThirdArg
     
-    if (Add-StaticRoute -Destination $destination -Gateway $gateway) {
+    if (Add-StaticRoute -Destination $destination -Gateway $gateway -InterfaceName $DevInterface) {
         Write-Host "`nRoute added!" -ForegroundColor Green
     } else {
         Write-Host "`nFailed to add route" -ForegroundColor Red
@@ -595,21 +705,6 @@ if ($Command -eq "route_del") {
         Write-Host "`nRoute removed!" -ForegroundColor Green
     } else {
         Write-Host "`nFailed to remove route" -ForegroundColor Red
-        exit 1
-    }
-    exit 0
-}
-
-if ($Command -eq "set_ics") {
-    if (-not $AdapterArg -or -not $ThirdArg) {
-        Write-Host "Error: Usage: .\ip.ps1 set_ics <source_adapter> <target_adapter>" -ForegroundColor Red
-        exit 1
-    }
-    
-    if (Set-ICS -SrcAdapter $AdapterArg -TargetAdapter $ThirdArg) {
-        Write-Host "`nICS configured successfully!" -ForegroundColor Green
-    } else {
-        Write-Host "`nFailed to configure ICS" -ForegroundColor Red
         exit 1
     }
     exit 0
@@ -724,6 +819,389 @@ function Set-ICS {
     }
 }
 
+# Helper: run sudo command via SSH, with or without password
+function Invoke-SshSudo {
+    param(
+        [string]$TargetServer,
+        [string]$Command,
+        [string]$SudoPassword = ""
+    )
+
+    if ($SudoPassword) {
+        # Use sudo -S to read password from stdin, -p '' to suppress prompt
+        "$SudoPassword`n" | ssh $TargetServer "sudo -S -p '' $Command" 2>&1
+    } else {
+        ssh $TargetServer "sudo -n $Command" 2>&1
+    }
+}
+
+# Helper: check sudo access, prompt for password if needed
+function Test-SudoAccess {
+    param([string]$TargetServer)
+
+    # Try passwordless sudo first
+    $sudoTest = ssh $TargetServer "sudo -n true 2>&1 && echo SUDO_OK || echo SUDO_FAIL" 2>&1
+    if ("$sudoTest" -match "SUDO_OK") {
+        Write-Host "  Sudo access OK (passwordless)" -ForegroundColor Green
+        return @{ Ok = $true; Password = "" }
+    }
+
+    # Passwordless failed, prompt for password
+    Write-Host "  Passwordless sudo not available." -ForegroundColor Yellow
+    $securePassword = Read-Host "  Enter sudo password for ${TargetServer}" -AsSecureString
+    $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword)
+    )
+
+    # Verify password works
+    $verifyTest = "$plainPassword`n" | ssh $TargetServer "sudo -S -p '' true 2>/dev/null && echo SUDO_OK || echo SUDO_FAIL" 2>&1
+    if ("$verifyTest" -notmatch "SUDO_OK") {
+        Write-Host "  Error: Sudo password verification failed" -ForegroundColor Red
+        return @{ Ok = $false; Password = "" }
+    }
+    Write-Host "  Sudo password verified" -ForegroundColor Green
+    return @{ Ok = $true; Password = $plainPassword }
+}
+
+function Enable-NAT {
+    param(
+        [string]$TargetServer,
+        [string]$Destination = "",
+        [switch]$Persist
+    )
+
+    Write-Host "`n=== Enabling NAT on $TargetServer ===" -ForegroundColor Magenta
+
+    # Check if SSH is available
+    $sshCmd = Get-Command ssh -ErrorAction SilentlyContinue
+    if (-not $sshCmd) {
+        Write-Host "Error: SSH client not found. Install OpenSSH client." -ForegroundColor Red
+        return $false
+    }
+
+    # Step 1: Test SSH connection
+    Write-Host "`n[1/6] Testing SSH connection to $TargetServer..." -ForegroundColor Cyan
+    $testResult = ssh -o ConnectTimeout=5 -o BatchMode=yes $TargetServer "echo OK" 2>&1
+    if ($LASTEXITCODE -ne 0 -or "$testResult".Trim() -ne "OK") {
+        Write-Host "  Cannot connect via SSH (requires key-based auth)" -ForegroundColor Red
+        Write-Host "  Try: enable_nat user@$TargetServer -d <dest>" -ForegroundColor Yellow
+        return $false
+    }
+    Write-Host "  SSH connection OK" -ForegroundColor Green
+
+    # Check sudo access (prompt for password if needed)
+    $sudoInfo = Test-SudoAccess -TargetServer $TargetServer
+    if (-not $sudoInfo.Ok) {
+        return $false
+    }
+    $sudoPassword = $sudoInfo.Password
+
+    # Step 2: Enable IP forwarding
+    Write-Host "`n[2/6] Enabling IP forwarding..." -ForegroundColor Cyan
+    Invoke-SshSudo -TargetServer $TargetServer -Command "sysctl -w net.ipv4.ip_forward=1" -SudoPassword $sudoPassword | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+    if ($Persist) {
+        Invoke-SshSudo -TargetServer $TargetServer -Command "bash -c ""echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-ipforward.conf""" -SudoPassword $sudoPassword | Out-Null
+    }
+    $forwardStatus = (ssh $TargetServer "cat /proc/sys/net/ipv4/ip_forward" 2>&1).Trim()
+    if ($forwardStatus -ne "1") {
+        Write-Host "  Failed to enable IP forwarding" -ForegroundColor Red
+        return $false
+    }
+    Write-Host "  IP forwarding enabled" -ForegroundColor Green
+
+    # Step 3: Find inbound interface (facing local machine via SSH session)
+    Write-Host "`n[3/6] Detecting inbound interface..." -ForegroundColor Cyan
+    $sshClient = ssh $TargetServer 'echo $SSH_CLIENT' 2>&1
+    $clientIP = ($sshClient -split ' ')[0]
+    if (-not $clientIP) {
+        Write-Host "  Cannot determine local IP from SSH session" -ForegroundColor Red
+        return $false
+    }
+    Write-Host "  Local IP (from SSH): $clientIP" -ForegroundColor Gray
+
+    $routeIn = ssh $TargetServer "ip route get $clientIP" 2>&1
+    $inInterface = ([regex]::Match("$routeIn", 'dev\s+(\S+)')).Groups[1].Value
+    if (-not $inInterface) {
+        Write-Host "  Cannot determine inbound interface" -ForegroundColor Red
+        Write-Host "  Route info: $routeIn" -ForegroundColor Gray
+        return $false
+    }
+    Write-Host "  Inbound interface: $inInterface" -ForegroundColor Green
+
+    # Step 4: Find outbound interface (can reach destination)
+    if ($Destination) {
+        Write-Host "`n[4/6] Finding outbound interface to $Destination..." -ForegroundColor Cyan
+        $routeOut = ssh $TargetServer "ip route get $Destination" 2>&1
+        $outInterface = ([regex]::Match("$routeOut", 'dev\s+(\S+)')).Groups[1].Value
+        if (-not $outInterface) {
+            Write-Host "  Cannot reach $Destination from $TargetServer" -ForegroundColor Red
+            Write-Host "  Route info: $routeOut" -ForegroundColor Gray
+            return $false
+        }
+        Write-Host "  Outbound interface: $outInterface" -ForegroundColor Green
+    } else {
+        Write-Host "`n[4/6] No destination specified, using default route..." -ForegroundColor Cyan
+        $defaultRoute = ssh $TargetServer "ip route show default" 2>&1
+        $outInterface = ([regex]::Match("$defaultRoute", 'dev\s+(\S+)')).Groups[1].Value
+        if (-not $outInterface) {
+            Write-Host "  No default route found" -ForegroundColor Red
+            return $false
+        }
+        Write-Host "  Outbound interface (default): $outInterface" -ForegroundColor Green
+    }
+
+    if ($inInterface -eq $outInterface) {
+        Write-Host "  Warning: inbound and outbound are the same ($inInterface)" -ForegroundColor Yellow
+    }
+
+    # Step 5: Configure iptables NAT rules
+    Write-Host "`n[5/6] Configuring iptables rules..." -ForegroundColor Cyan
+    Write-Host "  MASQUERADE on $outInterface" -ForegroundColor Gray
+    Write-Host "  FORWARD: $inInterface <-> $outInterface" -ForegroundColor Gray
+
+    # Clean up existing rules to avoid duplicates
+    Invoke-SshSudo -TargetServer $TargetServer -Command "iptables -t nat -D POSTROUTING -o $outInterface -j MASQUERADE 2>/dev/null; iptables -D FORWARD -i $inInterface -o $outInterface -j ACCEPT 2>/dev/null; iptables -D FORWARD -i $outInterface -o $inInterface -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; true" -SudoPassword $sudoPassword | Out-Null
+
+    # Add rules
+    $r1 = Invoke-SshSudo -TargetServer $TargetServer -Command "iptables -t nat -A POSTROUTING -o $outInterface -j MASQUERADE && echo OK" -SudoPassword $sudoPassword
+    $r2 = Invoke-SshSudo -TargetServer $TargetServer -Command "iptables -A FORWARD -i $inInterface -o $outInterface -j ACCEPT && echo OK" -SudoPassword $sudoPassword
+    $r3 = Invoke-SshSudo -TargetServer $TargetServer -Command "iptables -A FORWARD -i $outInterface -o $inInterface -m state --state RELATED,ESTABLISHED -j ACCEPT && echo OK" -SudoPassword $sudoPassword
+
+    if ("$r1".Trim() -ne "OK" -or "$r2".Trim() -ne "OK" -or "$r3".Trim() -ne "OK") {
+        Write-Host "  Some iptables rules failed" -ForegroundColor Red
+        Write-Host "  R1: $r1" -ForegroundColor Gray
+        Write-Host "  R2: $r2" -ForegroundColor Gray
+        Write-Host "  R3: $r3" -ForegroundColor Gray
+        return $false
+    }
+    Write-Host "  iptables rules configured" -ForegroundColor Green
+
+    # Step 6: Persist if requested
+    if ($Persist) {
+        Write-Host "`n[6/6] Persisting rules..." -ForegroundColor Cyan
+        $pkgCheck = ssh $TargetServer "dpkg -l iptables-persistent 2>/dev/null | grep -q '^ii' && echo INSTALLED || echo NOT_INSTALLED" 2>&1
+        if ("$pkgCheck".Trim() -eq "NOT_INSTALLED") {
+            Write-Host "  Installing iptables-persistent..." -ForegroundColor Gray
+            Invoke-SshSudo -TargetServer $TargetServer -Command "DEBIAN_FRONTEND=noninteractive apt install -y iptables-persistent" -SudoPassword $sudoPassword | Out-Null
+        }
+        Invoke-SshSudo -TargetServer $TargetServer -Command "netfilter-persistent save" -SudoPassword $sudoPassword | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+        Write-Host "  Rules saved persistently" -ForegroundColor Green
+    } else {
+        Write-Host "`n[6/6] Skipping persistence (use -Persist to save)" -ForegroundColor Gray
+    }
+
+    # Summary
+    Write-Host "`n=== NAT Configuration Summary ===" -ForegroundColor Magenta
+    Write-Host "  Server:         $TargetServer" -ForegroundColor White
+    Write-Host "  IP Forward:     enabled" -ForegroundColor White
+    Write-Host "  Inbound (in):   $inInterface" -ForegroundColor White
+    Write-Host "  Outbound (out): $outInterface" -ForegroundColor White
+    if ($Destination) { Write-Host "  Destination:    $Destination" -ForegroundColor White }
+    Write-Host "  Persisted:      $(if ($Persist) { 'yes' } else { 'no' })" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  Traffic flow: Local -> $TargetServer ($inInterface -> $outInterface) -> $Destination" -ForegroundColor Cyan
+
+    return $true
+}
+
+function Disable-NAT {
+    param(
+        [string]$TargetServer,
+        [string]$Destination = "",
+        [switch]$Persist
+    )
+
+    Write-Host "`n=== Disabling NAT on $TargetServer ===" -ForegroundColor Magenta
+
+    # Check if SSH is available
+    $sshCmd = Get-Command ssh -ErrorAction SilentlyContinue
+    if (-not $sshCmd) {
+        Write-Host "Error: SSH client not found. Install OpenSSH client." -ForegroundColor Red
+        return $false
+    }
+
+    # Step 1: Test SSH connection
+    Write-Host "`n[1/5] Testing SSH connection to $TargetServer..." -ForegroundColor Cyan
+    $testResult = ssh -o ConnectTimeout=5 -o BatchMode=yes $TargetServer "echo OK" 2>&1
+    if ($LASTEXITCODE -ne 0 -or "$testResult".Trim() -ne "OK") {
+        Write-Host "  Cannot connect via SSH (requires key-based auth)" -ForegroundColor Red
+        return $false
+    }
+    Write-Host "  SSH connection OK" -ForegroundColor Green
+
+    # Check sudo access (prompt for password if needed)
+    $sudoInfo = Test-SudoAccess -TargetServer $TargetServer
+    if (-not $sudoInfo.Ok) {
+        return $false
+    }
+    $sudoPassword = $sudoInfo.Password
+
+    # Step 2: Detect interfaces (same logic as enable_nat)
+    Write-Host "`n[2/5] Detecting interfaces..." -ForegroundColor Cyan
+    $sshClient = ssh $TargetServer 'echo $SSH_CLIENT' 2>&1
+    $clientIP = ($sshClient -split ' ')[0]
+    if (-not $clientIP) {
+        Write-Host "  Cannot determine local IP from SSH session" -ForegroundColor Red
+        return $false
+    }
+    Write-Host "  Local IP (from SSH): $clientIP" -ForegroundColor Gray
+
+    $routeIn = ssh $TargetServer "ip route get $clientIP" 2>&1
+    $inInterface = ([regex]::Match("$routeIn", 'dev\s+(\S+)')).Groups[1].Value
+    if (-not $inInterface) {
+        Write-Host "  Cannot determine inbound interface" -ForegroundColor Red
+        return $false
+    }
+    Write-Host "  Inbound interface: $inInterface" -ForegroundColor Green
+
+    if ($Destination) {
+        $routeOut = ssh $TargetServer "ip route get $Destination" 2>&1
+        $outInterface = ([regex]::Match("$routeOut", 'dev\s+(\S+)')).Groups[1].Value
+        if (-not $outInterface) {
+            Write-Host "  Cannot determine outbound interface to $Destination" -ForegroundColor Red
+            return $false
+        }
+    } else {
+        $defaultRoute = ssh $TargetServer "ip route show default" 2>&1
+        $outInterface = ([regex]::Match("$defaultRoute", 'dev\s+(\S+)')).Groups[1].Value
+        if (-not $outInterface) {
+            Write-Host "  No default route found" -ForegroundColor Red
+            return $false
+        }
+    }
+    Write-Host "  Outbound interface: $outInterface" -ForegroundColor Green
+
+    # Step 3: Remove iptables rules
+    Write-Host "`n[3/5] Removing iptables rules..." -ForegroundColor Cyan
+    Write-Host "  Removing MASQUERADE on $outInterface" -ForegroundColor Gray
+    Write-Host "  Removing FORWARD: $inInterface <-> $outInterface" -ForegroundColor Gray
+
+    # Delete rules (distinguish between "not found" and "sudo failed")
+    $r1 = Invoke-SshSudo -TargetServer $TargetServer -Command "iptables -t nat -D POSTROUTING -o $outInterface -j MASQUERADE 2>&1 && echo OK || echo FAILED" -SudoPassword $sudoPassword
+    $r2 = Invoke-SshSudo -TargetServer $TargetServer -Command "iptables -D FORWARD -i $inInterface -o $outInterface -j ACCEPT 2>&1 && echo OK || echo FAILED" -SudoPassword $sudoPassword
+    $r3 = Invoke-SshSudo -TargetServer $TargetServer -Command "iptables -D FORWARD -i $outInterface -o $inInterface -m state --state RELATED,ESTABLISHED -j ACCEPT 2>&1 && echo OK || echo FAILED" -SudoPassword $sudoPassword
+
+    # Check results: "OK" = removed, "does not exist" / "Bad rule" = not found, "sudo" = sudo error
+    function Get-IptablesResult($r) {
+        $r = "$r".Trim()
+        if ($r -match "OK$") { return "removed" }
+        if ($r -match "(does not exist|Bad rule|No chain)") { return "not found" }
+        if ($r -match "sudo|password") { return "sudo error" }
+        return "failed: $r"
+    }
+    $c1 = Get-IptablesResult $r1
+    $c2 = Get-IptablesResult $r2
+    $c3 = Get-IptablesResult $r3
+    $col = if ($c1 -eq "removed") { "Green" } elseif ($c1 -eq "not found") { "Gray" } else { "Red" }
+    Write-Host "  MASQUERADE:            $c1" -ForegroundColor $col
+    $col = if ($c2 -eq "removed") { "Green" } elseif ($c2 -eq "not found") { "Gray" } else { "Red" }
+    Write-Host "  FORWARD (in->out):    $c2" -ForegroundColor $col
+    $col = if ($c3 -eq "removed") { "Green" } elseif ($c3 -eq "not found") { "Gray" } else { "Red" }
+    Write-Host "  FORWARD (out->in):    $c3" -ForegroundColor $col
+
+    # Step 4: Disable IP forwarding
+    Write-Host "`n[4/5] Disabling IP forwarding..." -ForegroundColor Cyan
+    Invoke-SshSudo -TargetServer $TargetServer -Command "sysctl -w net.ipv4.ip_forward=0" -SudoPassword $sudoPassword | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+    if ($Persist) {
+        Invoke-SshSudo -TargetServer $TargetServer -Command "rm -f /etc/sysctl.d/99-ipforward.conf" -SudoPassword $sudoPassword | Out-Null
+    }
+    $forwardStatus = (ssh $TargetServer "cat /proc/sys/net/ipv4/ip_forward" 2>&1).Trim()
+    if ($forwardStatus -eq "0") {
+        Write-Host "  IP forwarding disabled" -ForegroundColor Green
+    } else {
+        Write-Host "  IP forwarding still enabled (value: $forwardStatus)" -ForegroundColor Yellow
+    }
+
+    # Step 5: Persist if requested
+    if ($Persist) {
+        Write-Host "`n[5/5] Persisting changes..." -ForegroundColor Cyan
+        $pkgCheck = ssh $TargetServer "dpkg -l iptables-persistent 2>/dev/null | grep -q '^ii' && echo INSTALLED || echo NOT_INSTALLED" 2>&1
+        if ("$pkgCheck".Trim() -eq "INSTALLED") {
+            Invoke-SshSudo -TargetServer $TargetServer -Command "netfilter-persistent save" -SudoPassword $sudoPassword | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+            Write-Host "  Rules saved persistently" -ForegroundColor Green
+        } else {
+            Write-Host "  iptables-persistent not installed, nothing to persist" -ForegroundColor Gray
+        }
+    } else {
+        Write-Host "`n[5/5] Skipping persistence (use -Persist to save)" -ForegroundColor Gray
+    }
+
+    # Summary
+    Write-Host "`n=== NAT Disabled Summary ===" -ForegroundColor Magenta
+    Write-Host "  Server:         $TargetServer" -ForegroundColor White
+    Write-Host "  Inbound (in):   $inInterface" -ForegroundColor White
+    Write-Host "  Outbound (out): $outInterface" -ForegroundColor White
+    Write-Host "  IP Forward:     $forwardStatus" -ForegroundColor White
+    Write-Host "  Persisted:      $(if ($Persist) { 'yes' } else { 'no' })" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  NAT removed. Traffic to $Destination will no longer be forwarded." -ForegroundColor Cyan
+
+    return $true
+}
+
+# === Command handlers (must be after all function definitions) ===
+
+if ($Command -eq "set_ics") {
+    if (-not $AdapterArg -or -not $ThirdArg) {
+        Write-Host "Error: Usage: .\ip.ps1 set_ics <source_adapter> <target_adapter>" -ForegroundColor Red
+        exit 1
+    }
+
+    if (Set-ICS -SrcAdapter $AdapterArg -TargetAdapter $ThirdArg) {
+        Write-Host "`nICS configured successfully!" -ForegroundColor Green
+    } else {
+        Write-Host "`nFailed to configure ICS" -ForegroundColor Red
+        exit 1
+    }
+    exit 0
+}
+
+if ($Command -eq "enable_nat") {
+    if (-not $AdapterArg) {
+        Write-Host "Error: Usage: .\ip.ps1 enable_nat <target_server> [-d <destination>] [-Persist]" -ForegroundColor Red
+        Write-Host "  target_server: SSH target (e.g., 192.168.137.2 or user@192.168.137.2)" -ForegroundColor Yellow
+        Write-Host "  -d <dest>:     Destination IP to route through (e.g., 172.17.1.122)" -ForegroundColor Yellow
+        Write-Host "  -Persist:      Save rules across reboot" -ForegroundColor Yellow
+        Write-Host "  -p 1:          Alternative for -Persist" -ForegroundColor Yellow
+        exit 1
+    }
+
+    $targetServer = $AdapterArg
+    $destination = $NatDest
+    $shouldPersist = $Persist -or (-not [string]::IsNullOrWhiteSpace($ProfileNum))
+
+    if (Enable-NAT -TargetServer $targetServer -Destination $destination -Persist:$shouldPersist) {
+        Write-Host "`nDone!" -ForegroundColor Green
+    } else {
+        Write-Host "`nFailed to enable NAT" -ForegroundColor Red
+        exit 1
+    }
+    exit 0
+}
+
+if ($Command -eq "disable_nat") {
+    if (-not $AdapterArg) {
+        Write-Host "Error: Usage: .\ip.ps1 disable_nat <target_server> [-d <destination>] [-Persist]" -ForegroundColor Red
+        Write-Host "  target_server: SSH target (e.g., 192.168.137.2 or user@192.168.137.2)" -ForegroundColor Yellow
+        Write-Host "  -d <dest>:     Destination IP (should match enable_nat -d)" -ForegroundColor Yellow
+        Write-Host "  -Persist:      Save cleared rules across reboot" -ForegroundColor Yellow
+        Write-Host "  -p 1:          Alternative for -Persist" -ForegroundColor Yellow
+        exit 1
+    }
+
+    $targetServer = $AdapterArg
+    $destination = $NatDest
+    $shouldPersist = $Persist -or (-not [string]::IsNullOrWhiteSpace($ProfileNum))
+
+    if (Disable-NAT -TargetServer $targetServer -Destination $destination -Persist:$shouldPersist) {
+        Write-Host "`nDone!" -ForegroundColor Green
+    } else {
+        Write-Host "`nFailed to disable NAT" -ForegroundColor Red
+        exit 1
+    }
+    exit 0
+}
+
 if (-not $ProfileNum) {
     Show-AllAdapters
     Show-RoutingTable
@@ -733,11 +1211,13 @@ if (-not $ProfileNum) {
     Write-Host "  .\ip.ps1                              Show all network info" -ForegroundColor White
     Write-Host "  .\ip.ps1 ping [target]                Test network connectivity" -ForegroundColor White
     Write-Host "  .\ip.ps1 set_first <adapter>          Set adapter as primary (requires admin)" -ForegroundColor White
-    Write-Host "  .\ip.ps1 route_add <dest> [gateway]   Add static route (requires admin)" -ForegroundColor White
+    Write-Host "  .\ip.ps1 route_add <dest> [gateway] [-dev <if>]   Add static route (requires admin)" -ForegroundColor White
     Write-Host "  .\ip.ps1 route_del <dest>             Delete route (requires admin)" -ForegroundColor White
     Write-Host "  .\ip.ps1 set_profile <1|2|3> [adapter] Apply network profile" -ForegroundColor White
     Write-Host "  .\ip.ps1 trace_route <target>         Trace route to target" -ForegroundColor White
     Write-Host "  .\ip.ps1 set_ip <adapter> <ip> [mask] Set static IP freely (requires admin)" -ForegroundColor White
+    Write-Host "  .\ip.ps1 enable_nat <server> [-d <dest>] [-Persist]  Enable NAT on remote Linux (via SSH)" -ForegroundColor White
+    Write-Host "  .\ip.ps1 disable_nat <server> [-d <dest>] [-Persist] Disable NAT on remote Linux (via SSH)" -ForegroundColor White
     Write-Host ""
     Write-Host "Profiles:" -ForegroundColor Cyan
     Write-Host "  Profile 1: Static IP (192.168.137.1/24, DHCP DNS)" -ForegroundColor Gray
