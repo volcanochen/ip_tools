@@ -13,6 +13,8 @@ Windows 网络配置管理 PowerShell 脚本，支持 IPv4 和 IPv6 双协议栈
 - 设置默认路由优先级（set_first）
 - ICS 网络共享配置（set_ics）
 - 远程 NAT 网关配置（enable_nat / disable_nat，通过 SSH 自动配置 Linux 服务器）
+- NAT 状态查询（show_nat：转发/规则/持久化/容器实况/流量链路）
+- 版本信息（version：编辑时间戳 + git commit，运行时自动读取）
 
 ## 系统要求
 
@@ -79,11 +81,26 @@ Windows 网络配置管理 PowerShell 脚本，支持 IPv4 和 IPv6 双协议栈
 ### 远程 NAT 网关
 
 ```powershell
-# 开启 NAT（通过 SSH 配置 Linux 服务器）
+# 开启 NAT（通过 SSH 配置 Linux 服务器；-d 指定目标并自动持久化 NM 路由）
 .\ip.ps1 enable_nat 192.168.137.2 -d 172.17.1.122 -Persist
+
+# 强制出接口（内核路由选错时，如目标落在 docker 网段）
+.\ip.ps1 enable_nat 192.168.137.2 -d 172.17.1.126 -dev enx00e04c68007b
+
+# 自动选择出接口（遍历候选接口逐个 ping，第一个通的胜出）
+.\ip.ps1 enable_nat 192.168.137.2 -d 172.17.1.126 -dev AUTO
 
 # 撤销 NAT
 .\ip.ps1 disable_nat 192.168.137.2 -d 172.17.1.122 -Persist
+
+# 查询 NAT 状态（-h 人工友好摘要；-d 与 enable_nat 保持一致）
+.\ip.ps1 show_nat 192.168.137.2 -d 172.17.1.122 -h
+```
+
+### 版本信息
+
+```powershell
+.\ip.ps1 version    # 显示版本号、编辑时间戳、git commit、仓库地址
 ```
 
 ## 命令速查
@@ -98,8 +115,10 @@ Windows 网络配置管理 PowerShell 脚本，支持 IPv4 和 IPv6 双协议栈
 | `.\ip.ps1 set_first <适配器>` | 设置主网络适配器 | 管理员 |
 | `.\ip.ps1 set_profile <1\|2\|3> [适配器]` | 应用 IP 配置 | 管理员 |
 | `.\ip.ps1 set_ics <源适配器> <目标适配器>` | 配置 ICS 网络共享 | 管理员 |
-| `.\ip.ps1 enable_nat <服务器> [-d <目标>] [-Persist]` | 配置远程 Linux NAT 网关 | SSH |
+| `.\ip.ps1 enable_nat <服务器> [-d <目标>] [-dev <接口\|AUTO>] [-Persist]` | 配置远程 Linux NAT 网关 | SSH |
 | `.\ip.ps1 disable_nat <服务器> [-d <目标>] [-Persist]` | 撤销远程 Linux NAT 配置 | SSH |
+| `.\ip.ps1 show_nat <服务器> [-d <目标>] [-dev <接口>] [-h]` | 查询 NAT/转发状态（-h 简明摘要） | SSH |
+| `.\ip.ps1 version` | 显示版本信息（时间戳 + commit） | 普通 |
 
 ---
 
@@ -194,7 +213,7 @@ Windows 网络配置管理 PowerShell 脚本，支持 IPv4 和 IPv6 双协议栈
 **用法**
 
 ```powershell
-.\ip.ps1 enable_nat <target_server> [-d <destination>] [-Persist]
+.\ip.ps1 enable_nat <target_server> [-d <destination>] [-dev <interface|AUTO>] [-Persist]
 ```
 
 **参数**
@@ -202,8 +221,25 @@ Windows 网络配置管理 PowerShell 脚本，支持 IPv4 和 IPv6 双协议栈
 | 参数 | 说明 |
 |------|------|
 | `<target_server>` | SSH 目标（如 `192.168.137.2` 或 `user@192.168.137.2`） |
-| `-d <destination>` | 目标 IP，用于检测出接口（如 `172.17.1.122`） |
+| `-d <destination>` | 目标 IP，用于检测出接口（如 `172.17.1.122`），并自动持久化对应 NM 路由 |
+| `-dev <interface>` | 强制出接口（如 `enx00e04c68007b`）；内核路由指向别处时自动补 `/32` 主机路由 |
+| `-dev AUTO` | 自动选择出接口：遍历候选接口逐个 ping 实测，第一个通的胜出，全不通则清理临时配置并报错 |
+| 不指定 `-dev` | 按内核路由选接口后 ping 验证；不通则列出候选接口交互式选择（q 退出并清理） |
 | `-Persist` | 持久化规则（重启后保留），也可用 `-p 1` |
+
+**出接口选择规则**
+
+1. `-dev <接口>` — 强制使用该接口（校验接口存在）
+2. `-dev AUTO` — 候选接口排序（有 NM 路由条目的优先）逐个实测：有网关的临时加 `/32` 路由后 ping，无网关的 `ping -I` 探测直连
+3. 不指定 — 信任内核 `ip route get`，但追加 ping 验证；不通时进入交互选择
+4. 候选接口排除：`lo`、`docker*`、`veth*`、`br-*`、`virbr*`、`wg*`、`tailscale*`、入接口
+
+**NM 路由持久化（-d 时自动处理）**
+
+- 从该接口的 NM 连接已有 `ipv4.routes` 条目复用 next-hop
+- 用 `+ipv4.routes` **追加**语法写入，已有条目一个不删；写入后回读验证
+- 兼容新旧 nmcli 路由语法（`ip/掩码 网关` / `ip/掩码 via 网关`）
+- 运行时同步 `ip route replace` 保证立即生效
 
 **前提条件**
 
@@ -221,8 +257,13 @@ flowchart TD
     S1 -->|sudo 失败| Fail2([失败: 输入密码或配置免密 sudo])
     S1 -->|成功| S2[2. 开启 IP 转发]
     S2 --> S3[3. 检测入接口 - SSH 来源方向]
-    S3 --> S4[4. 检测出接口 - -d 目标方向]
-    S4 --> S5[5. 配置 iptables 规则]
+    S3 --> S4{4. 出接口决策}
+    S4 -->|"-dev 接口"| F1[强制指定 + 校验存在]
+    S4 -->|"-dev AUTO"| F2[遍历候选接口 ping 实测]
+    S4 -->|"带 -d"| F3[内核路由 + ping 验证<br>不通则交互选择]
+    S4 -->|"无 -d"| F4[默认路由]
+    F1 & F2 & F3 & F4 --> S4b[4b. NM 路由持久化<br>+ipv4.routes 追加, 运行时 replace]
+    S4b --> S5[5. 配置 iptables 规则]
     S5 --> S5a["MASQUERADE + FORWARD 双向"]
     S5a --> S6{是否 -Persist?}
     S6 -->|是| S6a["安装 iptables-persistent + save"]
@@ -254,8 +295,14 @@ flowchart LR
 # 基本：开启 NAT，不持久化
 .\ip.ps1 enable_nat 192.168.137.2 -d 172.17.1.122
 
-# 持久化
+# 持久化（含 NM 路由 + iptables 双持久化）
 .\ip.ps1 enable_nat 192.168.137.2 -d 172.17.1.122 -Persist
+
+# 强制出接口（内核把目标路由进 docker0 等错误接口时）
+.\ip.ps1 enable_nat 192.168.137.2 -d 172.17.1.126 -dev enx00e04c68007b
+
+# 自动选择出接口（实测通过才保留，全失败自动清理）
+.\ip.ps1 enable_nat 192.168.137.2 -d 172.17.1.126 -dev AUTO
 
 # 带用户名
 .\ip.ps1 enable_nat user@192.168.137.2 -d 172.17.1.122 -Persist
@@ -316,6 +363,56 @@ flowchart TD
 
 # 3. 验证连通性已断开
 ping 172.17.1.122
+```
+
+#### show_nat
+
+查询远程服务器的 NAT/转发配置现状。`-d` / `-dev` 与 enable_nat 参数含义一致，用于复现同一条出接口决策路径。
+
+**用法**
+
+```powershell
+.\ip.ps1 show_nat <target_server> [-d <destination>] [-dev <interface>] [-h]
+```
+
+**两种输出模式**
+
+| 模式 | 内容 |
+|------|------|
+| `-h`（推荐） | 人工友好摘要：转发状态、NAT 状态、入/出接口、docker 容器实况、NM 路由持久化、规则人话翻译、流量链路 |
+| 不带 `-h` | 原始详情：ip_forward 值、iptables NAT/FORWARD 规则原样列出（含计数）、持久化安装状态 |
+
+**`-h` 摘要包含的检查项**
+
+| 检查项 | 说明 |
+|--------|------|
+| IP forwarding | 当前值 + `/etc/sysctl.d/99-ipforward.conf` 持久化状态 |
+| 入/出接口 | 入接口由 SSH 来源反查；出接口按 `-d` 路由 / `-dev` 强制 / 默认路由 三级决策 |
+| NM route persist | `-d` 的目标是否已写入对应 NM 连接的 `ipv4.routes`（重启后是否保留） |
+| Docker check | `docker ps` 实查容器与 IP；带 `-d` 时判定目标 IP 是否真有容器持有 |
+| 残留接口标注 | 规则引用了主机上不存在的接口（如已删除的 eth1）时黄色标注 `[stale iface]`；否定引用（`!docker0`）与通配符（`+`）不标注 |
+| Traffic flows | 多条流量链路：`-d` 专属路径置顶，其余每条 MASQUERADE 规则一条（否定引用显示为 "any iface except"） |
+| Persistence | iptables-persistent 是否安装、`/etc/iptables/rules.v4` 是否已保存 |
+
+**示例**
+
+```powershell
+# 常用：与 enable_nat 同参数查询
+.\ip.ps1 show_nat 192.168.137.2 -d 172.17.1.122 -h
+
+# 强制出接口视角（与 enable_nat -dev 对应）
+.\ip.ps1 show_nat 192.168.137.2 -d 172.17.1.126 -dev enx00e04c68007b -h
+
+# 原始规则详情
+.\ip.ps1 show_nat 192.168.137.2
+```
+
+#### version
+
+显示脚本版本信息。版本号手动维护（`$ScriptVersion`），编辑时间戳与 git commit 运行时自动读取（非 git 目录时显示提示）。
+
+```powershell
+.\ip.ps1 version          # 也可用 -v / --version
 ```
 
 ---
@@ -425,7 +522,12 @@ ping 172.17.1.122
 - 开启 IP 转发：`Invoke-SshSudo "sysctl -w net.ipv4.ip_forward=1"`
 - 持久化 IP 转发（`-Persist`）：写入 `/etc/sysctl.d/99-ipforward.conf`
 - 检测入接口（SSH 来源方向）：`ssh <服务器> 'echo $SSH_CLIENT'` → `ip route get <客户端IP>`
-- 检测出接口（`-d` 目标方向）：`ssh <服务器> "ip route get <目标IP>"`
+- 出接口决策（`Select-NatOutboundInterface`）：
+  - `-dev <接口>`：强制指定，`ip link show` 校验存在；内核路由指向别处时警告并稍后补 `/32` 主机路由
+  - `-dev AUTO`：`ls /sys/class/net` 取候选（排除 lo/docker/veth/br-/virbr/wg/tailscale/入接口），NM 路由条目优先，逐个实测（临时 `ip route replace` + ping，失败即删；无网关则 `ping -I` 探测直连）；全失败做 `ip route del <目标>/32` 兜底清理并报错
+  - 带 `-d`：`ip route get <目标IP>` 取内核决策，追加 `ping -c 2 -W 1` 验证；不通进入交互式候选选择（q 退出并清理）
+  - 无 `-d`：默认路由接口
+- NM 路由持久化（带 `-d`）：找出入接口对应的活动 NM 连接，从其 `ipv4.routes` 既有条目提取 next-hop（兼容新旧格式），用 `+ipv4.routes` 追加 `/32` 路由（不删已有条目），回读验证；运行时 `ip route replace` 立即生效
 - 清理已有 iptables 规则：`Invoke-SshSudo "iptables -t nat -D POSTROUTING ..."` / `"iptables -D FORWARD ..."`
 - 添加 NAT 伪装规则：`Invoke-SshSudo "iptables -t nat -A POSTROUTING -o <出接口> -j MASQUERADE"`
 - 添加 FORWARD 放行规则：`Invoke-SshSudo "iptables -A FORWARD -i <入接口> -o <出接口> -j ACCEPT"`
@@ -446,6 +548,29 @@ ping 172.17.1.122
 - 关闭 IP 转发：`Invoke-SshSudo "sysctl -w net.ipv4.ip_forward=0"`
 - 清除持久化配置（`-Persist`）：`Invoke-SshSudo "rm -f /etc/sysctl.d/99-ipforward.conf"`
 - 保存规则（`-Persist`）：`Invoke-SshSudo "netfilter-persistent save"`
+
+### show_nat
+
+由 `Show-NAT` 实现，只读查询（除临时探测路由外不改动服务器配置）：
+
+- SSH/sudo 检测：同 `enable_nat`
+- IP 转发：`sysctl net.ipv4.ip_forward` + `cat /etc/sysctl.d/99-ipforward.conf`
+- 入接口：`echo $SSH_CLIENT` → `ip route get <客户端IP>`
+- 出接口：`-dev` 强制 > `-d` 时 `ip route get <目标>` > 默认路由，附内核路由详情
+- NM 路由持久化检查：`nmcli -t -f ipv4.routes con show <连接>`，边界正则匹配目标 IP（避免 `.12` 误配 `.122`）
+- Docker 实况：`docker ps --format '{{.Names}} {{.IPAddress}}'`；带 `-d` 时判定目标归属
+- 规则解析：`iptables -t nat -S POSTROUTING` / `iptables -S FORWARD`（`Get-RuleOpt` 提取 `-s`/`-o`，兼容 `!` 否定与 `+` 通配）
+- 残留接口标注（`Test-StaleIface`）：`ls /sys/class/net` 对比规则引用的接口，仅正向引用缺失接口时标注
+- 流量链路：`-d` 专属路径（路由网关 + 入/出接口 + 目标）置顶，再按每条 MASQUERADE 规则生成，去重
+
+### version
+
+由 `Show-Version` 实现：
+
+- 版本号：脚本内 `$ScriptVersion` 常量（功能变更时手动更新）
+- 编辑时间戳：`(Get-Item $PSCommandPath).LastWriteTime`
+- git commit：`git -C $PSScriptRoot log -1 --format=...`（非 git 目录时显示提示）
+- 仓库地址：`git remote get-url origin`
 
 ---
 
@@ -505,7 +630,9 @@ Done!
 
 [1/6] Testing SSH connection to 192.168.137.2...
   SSH connection OK
-  Sudo access OK (passwordless)
+  Passwordless sudo not available.
+  Enter sudo password for 192.168.137.2:*****
+  Sudo password verified
 
 [2/6] Enabling IP forwarding...
   net.ipv4.ip_forward = 1
@@ -515,8 +642,12 @@ Done!
   Local IP (from SSH): 192.168.137.1
   Inbound interface: enp2s0
 
-[4/6] Finding outbound interface to 172.17.1.122...
+[4/6] Outbound interface forced to enx00e04c68007b (-dev)...
+  Route info: 172.17.1.126 via 192.168.238.254 dev enx00e04c68007b src 192.168.238.94
   Outbound interface: enx00e04c68007b
+  Ensuring route to 172.17.1.126 goes via enx00e04c68007b (runtime + NM persistent)...
+  Persistent route added (+ipv4.routes '172.17.1.126/32 192.168.238.254', existing entries preserved)
+  Runtime route active: 172.17.1.126/32 via 192.168.238.254 dev enx00e04c68007b
 
 [5/6] Configuring iptables rules...
   MASQUERADE on enx00e04c68007b
@@ -530,10 +661,10 @@ Done!
   IP Forward:     enabled
   Inbound (in):   enp2s0
   Outbound (out): enx00e04c68007b
-  Destination:    172.17.1.122
+  Destination:    172.17.1.126
   Persisted:      no
 
-  Traffic flow: Local -> 192.168.137.2 (enp2s0 -> enx00e04c68007b) -> 172.17.1.122
+  Traffic flow: local(192.168.137.1) -> in:enp2s0 -> [NAT out:enx00e04c68007b via 192.168.238.254] -> 172.17.1.126
 
 Done!
 ```
@@ -571,6 +702,47 @@ Done!
   NAT removed. Traffic to 172.17.1.122 will no longer be forwarded.
 
 Done!
+```
+
+### show_nat -h
+
+```
+.\ip.ps1 show_nat 192.168.137.2 -d 172.17.1.126 -h
+
+=== NAT Status on 192.168.137.2 ===
+
+[1/4] Testing SSH connection to 192.168.137.2...
+  SSH connection OK
+  Passwordless sudo not available.
+  Enter sudo password for 192.168.137.2:*****
+  Sudo password verified
+
+=== NAT Summary: 192.168.137.2 ===
+
+  IP forwarding:  enabled  (persistent: yes)
+  NAT status:     ACTIVE
+  Inbound iface:  enp2s0 (local 192.168.137.1)
+  Outbound iface: enx00e04c68007b (route to 172.17.1.126)
+  Route detail:   172.17.1.126 via 192.168.238.254 dev enx00e04c68007b src 192.168.238.94
+  NM route persist: 'work' ipv4.routes contains 172.17.1.126
+  Docker check:   1 containers, but IPs not visible (custom networks - verify via docker inspect)
+
+  NAT rules (POSTROUTING):
+    1. 172.17.0.0/16 -> via !docker0  (MASQUERADE)
+    2. any source -> via enx00e04c68007b  (MASQUERADE)
+
+  FORWARD rules:
+    default policy: DROP
+    1. in:enp2s0 out:enx00e04c68007b -> ACCEPT
+    2. in:enx00e04c68007b out:enp2s0 state:RELATED,ESTABLISHED -> ACCEPT
+    (+ 2 docker-related rules hidden)
+
+  Traffic flows:
+    1. to 172.17.1.126: local(192.168.137.1) -> in:enp2s0 -> [NAT out:enx00e04c68007b via 192.168.238.254] -> 172.17.1.126
+    2. 172.17.0.0/16 -> [NAT out:any iface except docker0] -> external
+    3. any source -> [NAT out:enx00e04c68007b] -> external
+
+  Persistence:  iptables-persistent installed, but no rules saved yet
 ```
 
 ## 适配器状态说明

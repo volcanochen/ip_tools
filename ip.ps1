@@ -5,9 +5,35 @@
     [Parameter(Position=3)][string]$FourthArg,
     [Parameter()][Alias("p")][string]$ProfileNum,
     [Parameter()][Alias("d")][string]$NatDest,
+    [Parameter()][Alias("h")][switch]$Human,
     [Parameter()][switch]$Persist,
     [Parameter()][Alias("dev")][string]$DevInterface
 )
+
+# === 版本信息（功能变更时手动更新 $ScriptVersion；时间戳/commit 运行时自动读取） ===
+$ScriptVersion = "1.3.2"
+
+function Show-Version {
+    $editTime = (Get-Item $PSCommandPath).LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+    Write-Host "`n=== ip.ps1 Version Info ===" -ForegroundColor Magenta
+    Write-Host "  Version: $ScriptVersion" -ForegroundColor Cyan
+    Write-Host "  Edited:  $editTime" -ForegroundColor White
+
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        $commit = git -C $PSScriptRoot log -1 --format="%h %ci %s" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $commit) {
+            Write-Host "  Commit:  $commit" -ForegroundColor White
+        } else {
+            Write-Host "  Commit:  (not a git repository)" -ForegroundColor Gray
+        }
+        $remote = git -C $PSScriptRoot remote get-url origin 2>$null
+        if ($LASTEXITCODE -eq 0 -and $remote) {
+            Write-Host "  Repo:    $remote" -ForegroundColor White
+        }
+    } else {
+        Write-Host "  Commit:  (git not available)" -ForegroundColor Gray
+    }
+}
 
 # 定义 Trace-Route 函数（必须在命令处理逻辑之前）
 function Trace-Route {
@@ -117,6 +143,9 @@ if ($Command -eq "set_profile") {
 } elseif ($Command -eq "trace_route") {
     $target = $AdapterArg
     Trace-Route -Target $target
+    exit 0
+} elseif ($Command -eq "version" -or $Command -eq "-v" -or $Command -eq "--version") {
+    Show-Version
     exit 0
 } elseif ($Command -eq "set_ip") {
     if (-not $AdapterArg -or -not $ThirdArg) {
@@ -863,6 +892,119 @@ function Test-SudoAccess {
     return @{ Ok = $true; Password = $plainPassword }
 }
 
+# Select the outbound interface for a NAT destination by actually testing reachability.
+# -Auto: iterate candidates (NM-route-backed first, then on-link probe); none reachable -> cleanup + fail.
+# otherwise: interactive numbered picker; q aborts with cleanup.
+# Returns @{ Ok; Iface; ViaGw } (ViaGw empty = on-link success).
+function Select-NatOutboundInterface {
+    param(
+        [string]$TargetServer,
+        [string]$Destination,
+        [switch]$Auto,
+        [string]$SudoPassword,
+        [string]$InboundInterface
+    )
+
+    # Candidate interfaces: exclude loopback, docker/bridge/veth plumbing and the inbound NIC
+    $ifaceRaw = ssh $TargetServer "ls /sys/class/net" 2>&1
+    $candidates = @(@(($ifaceRaw -split '\s+') | Where-Object { $_ }) | Where-Object {
+        $_ -ne "lo" -and $_ -ne $InboundInterface -and $_ -notmatch "^(docker|veth|br-|virbr|wg|tailscale)"
+    })
+
+    # Enrich each candidate with its NM connection name and next-hop from existing ipv4.routes
+    $nmConns = ssh $TargetServer "nmcli -t -f NAME,DEVICE con show --active" 2>&1
+    $info = @()
+    foreach ($cand in $candidates) {
+        $connName = ""
+        if ("$nmConns" -notmatch "not found") {
+            foreach ($line in @($nmConns)) {
+                if ("$line" -match "^(.*):$([regex]::Escape($cand))$") { $connName = $Matches[1]; break }
+            }
+        }
+        $nh = ""
+        if ($connName) {
+            $routes = (ssh $TargetServer "nmcli -t -f ipv4.routes con show '$connName'" 2>&1 | Out-String).Trim()
+            if ($routes -match "nh\s*=\s*(\d{1,3}(?:\.\d{1,3}){3})") { $nh = $Matches[1] }
+            else {
+                $ips = @([regex]::Matches("$routes", "(\d{1,3}(?:\.\d{1,3}){3})") | ForEach-Object { $_.Groups[1].Value })
+                if ($ips.Count -ge 2) { $nh = $ips[1] }
+            }
+        }
+        $info += @{ Iface = $cand; Conn = $connName; Nh = $nh }
+    }
+    # NM-route-backed candidates first (deterministic: Where-Object, not Sort-Object,
+    # which is unstable in Windows PowerShell 5.1)
+    $info = @(@($info | Where-Object { $_.Nh }) + @($info | Where-Object { -not $_.Nh }))
+
+    if ($info.Count -eq 0) {
+        Write-Host "  No candidate interfaces found on $TargetServer" -ForegroundColor Red
+        return @{ Ok = $false; Iface = ""; ViaGw = "" }
+    }
+
+    # Test one candidate: with a known next-hop, install a temporary /32 route and ping;
+    # without one, probe on-link reachability (ping -I). Failed routes are removed immediately.
+    $testCand = {
+        param($cand, $nh)
+        if ($nh) {
+            Invoke-SshSudo -TargetServer $TargetServer -Command "ip route replace $Destination/32 via $nh dev $cand" -SudoPassword $SudoPassword | Out-Null
+            ssh $TargetServer "ping -c 2 -W 1 $Destination" 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { return @{ Ok = $true; Via = $nh } }
+            Invoke-SshSudo -TargetServer $TargetServer -Command "ip route del $Destination/32 dev $cand 2>/dev/null; true" -SudoPassword $SudoPassword | Out-Null
+            return @{ Ok = $false }
+        } else {
+            ssh $TargetServer "ping -c 2 -W 1 -I $cand $Destination" 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { return @{ Ok = $true; Via = "" } }
+            return @{ Ok = $false }
+        }
+    }
+
+    if ($Auto) {
+        Write-Host "  AUTO: testing candidate interfaces for reachability to $Destination..." -ForegroundColor Cyan
+        foreach ($entry in $info) {
+            $hint = if ($entry.Nh) { "route via $($entry.Nh)" } else { "on-link probe" }
+            Write-Host "  Testing $($entry.Iface) ($hint)..." -ForegroundColor Gray
+            $res = & $testCand -cand $entry.Iface -nh $entry.Nh
+            if ($res.Ok) {
+                Write-Host "  AUTO selected: $($entry.Iface) ($Destination responds)" -ForegroundColor Green
+                return @{ Ok = $true; Iface = $entry.Iface; ViaGw = $res.Via }
+            }
+        }
+        # Final residue sweep: drop any /32 route left for the destination
+        Invoke-SshSudo -TargetServer $TargetServer -Command "ip route del $Destination/32 2>/dev/null; true" -SudoPassword $SudoPassword | Out-Null
+        Write-Host "  AUTO failed: no interface reaches $Destination (temporary routes cleaned up)" -ForegroundColor Red
+        return @{ Ok = $false; Iface = ""; ViaGw = "" }
+    }
+
+    while ($true) {
+        Write-Host "`n  $Destination does not respond via the kernel-selected route. Pick the outbound interface:" -ForegroundColor Yellow
+        $i = 1
+        foreach ($entry in $info) {
+            $hint = if ($entry.Conn) { "NM '$($entry.Conn)'" } else { "no NM connection" }
+            if ($entry.Nh) { $hint += ", existing route via $($entry.Nh)" }
+            Write-Host "    $i. $($entry.Iface)  ($hint)" -ForegroundColor White
+            $i++
+        }
+        $choice = Read-Host "  Enter number (q=abort)"
+        if ("$choice" -match '^q$') {
+            Invoke-SshSudo -TargetServer $TargetServer -Command "ip route del $Destination/32 2>/dev/null; true" -SudoPassword $SudoPassword | Out-Null
+            return @{ Ok = $false; Iface = ""; ViaGw = "" }
+        }
+        $idx = 0
+        if ([int]::TryParse("$choice", [ref]$idx) -and $idx -ge 1 -and $idx -le $info.Count) {
+            $entry = $info[$idx - 1]
+            Write-Host "  Testing $($entry.Iface)..." -ForegroundColor Gray
+            $res = & $testCand -cand $entry.Iface -nh $entry.Nh
+            if ($res.Ok) {
+                Write-Host "  Selected: $($entry.Iface) ($Destination responds)" -ForegroundColor Green
+                return @{ Ok = $true; Iface = $entry.Iface; ViaGw = $res.Via }
+            }
+            Write-Host "  $Destination does not respond via $($entry.Iface) - pick another" -ForegroundColor Red
+        } else {
+            Write-Host "  Invalid choice" -ForegroundColor Yellow
+        }
+    }
+}
+
 function Enable-NAT {
     param(
         [string]$TargetServer,
@@ -929,7 +1071,27 @@ function Enable-NAT {
     Write-Host "  Inbound interface: $inInterface" -ForegroundColor Green
 
     # Step 4: Find outbound interface (can reach destination)
-    if ($Destination) {
+    $viaGw = ""
+    $forcedDev = ""
+    if ($DevInterface -and $DevInterface -ne "AUTO") {
+        Write-Host "`n[4/6] Outbound interface forced to $DevInterface (-dev)..." -ForegroundColor Cyan
+        ssh $TargetServer "ip link show $DevInterface" 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  Interface $DevInterface does not exist on $TargetServer" -ForegroundColor Red
+            return $false
+        }
+        $forcedDev = $DevInterface
+        $outInterface = $forcedDev
+        if ($Destination) {
+            $routeOut = ssh $TargetServer "ip route get $Destination" 2>&1
+            $kernelDev = ([regex]::Match("$routeOut", 'dev\s+(\S+)')).Groups[1].Value
+            Write-Host "  Route info: $("$routeOut".Trim())" -ForegroundColor Gray
+            if ($kernelDev -and $kernelDev -ne $forcedDev) {
+                Write-Host "  Warning: kernel currently routes $Destination via $kernelDev - a host route will be added to override it" -ForegroundColor Yellow
+            }
+        }
+        Write-Host "  Outbound interface: $outInterface" -ForegroundColor Green
+    } elseif ($Destination) {
         Write-Host "`n[4/6] Finding outbound interface to $Destination..." -ForegroundColor Cyan
         $routeOut = ssh $TargetServer "ip route get $Destination" 2>&1
         $outInterface = ([regex]::Match("$routeOut", 'dev\s+(\S+)')).Groups[1].Value
@@ -938,7 +1100,26 @@ function Enable-NAT {
             Write-Host "  Route info: $routeOut" -ForegroundColor Gray
             return $false
         }
+        $viaGw = ([regex]::Match("$routeOut", 'via\s+(\S+)')).Groups[1].Value
         Write-Host "  Outbound interface: $outInterface" -ForegroundColor Green
+
+        # Verify the kernel-selected path actually reaches the destination
+        # (kernel can route e.g. into a docker bridge where no host answers)
+        ssh $TargetServer "ping -c 2 -W 1 $Destination" 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  Warning: $Destination does not respond via $outInterface" -ForegroundColor Yellow
+            $autoMode = ($DevInterface -eq "AUTO")
+            $sel = Select-NatOutboundInterface -TargetServer $TargetServer -Destination $Destination -Auto:$autoMode -SudoPassword $sudoPassword -InboundInterface $inInterface
+            if (-not $sel.Ok) {
+                Write-Host "  Cannot reach $Destination from any interface - aborting (temporary config cleaned)" -ForegroundColor Red
+                return $false
+            }
+            $outInterface = $sel.Iface
+            $viaGw = $sel.ViaGw
+            $forcedDev = $outInterface
+            $selHow = if ($autoMode) { "auto-selected" } else { "user-selected" }
+            Write-Host "  Outbound interface ($selHow): $outInterface" -ForegroundColor Green
+        }
     } else {
         Write-Host "`n[4/6] No destination specified, using default route..." -ForegroundColor Cyan
         $defaultRoute = ssh $TargetServer "ip route show default" 2>&1
@@ -952,6 +1133,111 @@ function Enable-NAT {
 
     if ($inInterface -eq $outInterface) {
         Write-Host "  Warning: inbound and outbound are the same ($inInterface)" -ForegroundColor Yellow
+    }
+
+    # Step 4b: make the destination route persistent via NetworkManager
+    # (+ipv4.routes APPENDS the entry; existing routes are never touched)
+    if ($Destination -and $forcedDev) {
+        # Forced interface: kernel may route the destination elsewhere (e.g. docker0),
+        # so reuse the next-hop from existing route entries on that connection and add
+        # a /32 host route (runtime + persistent)
+        Write-Host "  Ensuring route to $Destination goes via $forcedDev (runtime + NM persistent)..." -ForegroundColor Gray
+        $nmConns = ssh $TargetServer "nmcli -t -f NAME,DEVICE con show --active" 2>&1
+        $nmConnName = ""
+        if ("$nmConns" -match "not found") {
+            Write-Host "  nmcli not available - route persistence skipped" -ForegroundColor Yellow
+        } else {
+            foreach ($line in @($nmConns)) {
+                if ("$line" -match "^(.*):$([regex]::Escape($forcedDev))$") { $nmConnName = $Matches[1]; break }
+            }
+            if (-not $nmConnName) {
+                Write-Host "  No active NM connection on $forcedDev - route persistence skipped" -ForegroundColor Yellow
+            } else {
+                $nmRoutes = (ssh $TargetServer "nmcli -t -f ipv4.routes con show '$nmConnName'" 2>&1 | Out-String).Trim()
+                $destPat = "(?<![\d.])" + [regex]::Escape($Destination) + "(?![\d.])"
+
+                # Next-hop: reuse the one from existing route entries on this connection
+                # (new format "nh = x.x.x.x", else old format "dest/32 x.x.x.x")
+                $nh = ""
+                if ($nmRoutes -match "nh\s*=\s*(\d{1,3}(?:\.\d{1,3}){3})") { $nh = $Matches[1] }
+                else {
+                    $routeIps = @([regex]::Matches("$nmRoutes", "(\d{1,3}(?:\.\d{1,3}){3})") | ForEach-Object { $_.Groups[1].Value })
+                    if ($routeIps.Count -ge 2) { $nh = $routeIps[1] }
+                }
+
+                if ("$nmRoutes" -match $destPat) {
+                    Write-Host "  NM route already present in '$nmConnName' ipv4.routes - nothing to add" -ForegroundColor Green
+                } else {
+                    $nhNote = if ($nh) { " (reusing next-hop $nh from existing entries)" } else { " (on-link)" }
+                    Write-Host "  Adding persistent route via '$nmConnName'$nhNote..." -ForegroundColor Gray
+                    # Older nmcli only accepts "ip/prefix next_hop"; newer also allows "via" - try both
+                    $modTried = if ($nh) { @("$Destination/32 $nh", "$Destination/32 via $nh") } else { @("$Destination/32") }
+                    $added = $false
+                    $modOut = $null
+                    foreach ($routeSpec in $modTried) {
+                        $modOut = Invoke-SshSudo -TargetServer $TargetServer -Command "nmcli con mod '$nmConnName' +ipv4.routes '$routeSpec'" -SudoPassword $sudoPassword
+                        $nmRoutesAfter = (ssh $TargetServer "nmcli -t -f ipv4.routes con show '$nmConnName'" 2>&1 | Out-String).Trim()
+                        if ("$nmRoutesAfter" -match $destPat) {
+                            Write-Host "  Persistent route added (+ipv4.routes '$routeSpec', existing entries preserved)" -ForegroundColor Green
+                            $added = $true
+                            break
+                        }
+                    }
+                    if (-not $added) {
+                        Write-Host "  Warning: failed to persist route via NM" -ForegroundColor Red
+                        if ($modOut) { Write-Host "  nmcli said: $modOut" -ForegroundColor Gray }
+                        Write-Host "  Add manually: nmcli con mod '$nmConnName' +ipv4.routes '$($modTried[0])'" -ForegroundColor Yellow
+                    }
+                }
+
+                # Runtime host route so the forced interface takes effect immediately
+                $routeNow = ssh $TargetServer "ip route get $Destination" 2>&1
+                $routeNowDev = ([regex]::Match("$routeNow", 'dev\s+(\S+)')).Groups[1].Value
+                if ($routeNowDev -ne $forcedDev) {
+                    $rtCmd = if ($nh) { "ip route replace $Destination/32 via $nh dev $forcedDev" } else { "ip route replace $Destination/32 dev $forcedDev" }
+                    Invoke-SshSudo -TargetServer $TargetServer -Command $rtCmd -SudoPassword $sudoPassword | Out-Null
+                    $routeNow2 = ssh $TargetServer "ip route get $Destination" 2>&1
+                    $routeNowDev2 = ([regex]::Match("$routeNow2", 'dev\s+(\S+)')).Groups[1].Value
+                    if ($routeNowDev2 -eq $forcedDev) {
+                        $rtNote = if ($nh) { "via $nh" } else { "on-link" }
+                        Write-Host "  Runtime route active: $Destination/32 dev $forcedDev ($rtNote)" -ForegroundColor Green
+                    } else {
+                        Write-Host "  Warning: runtime route replace failed ($("$routeNow2".Trim()))" -ForegroundColor Red
+                    }
+                }
+            }
+        }
+    } elseif ($Destination -and $viaGw) {
+        Write-Host "  Checking NetworkManager route persistence for $Destination..." -ForegroundColor Gray
+        $nmConns = ssh $TargetServer "nmcli -t -f NAME,DEVICE con show --active" 2>&1
+        $nmConnName = ""
+        if ("$nmConns" -match "not found") {
+            Write-Host "  nmcli not available - route persistence skipped (runtime route still works)" -ForegroundColor Yellow
+        } else {
+            foreach ($line in @($nmConns)) {
+                if ("$line" -match "^(.*):$([regex]::Escape($outInterface))$") { $nmConnName = $Matches[1]; break }
+            }
+            if (-not $nmConnName) {
+                Write-Host "  No active NM connection on $outInterface - route persistence skipped" -ForegroundColor Yellow
+            } else {
+                $nmRoutes = (ssh $TargetServer "nmcli -t -f ipv4.routes con show '$nmConnName'" 2>&1 | Out-String).Trim()
+                $destPat = "(?<![\d.])" + [regex]::Escape($Destination) + "(?![\d.])"
+                if ("$nmRoutes" -match $destPat) {
+                    Write-Host "  NM route already present in '$nmConnName' ipv4.routes - nothing to add" -ForegroundColor Green
+                } else {
+                    Invoke-SshSudo -TargetServer $TargetServer -Command "nmcli con mod '$nmConnName' +ipv4.routes '$Destination/32 via $viaGw'" -SudoPassword $sudoPassword | Out-Null
+                    $nmRoutesAfter = (ssh $TargetServer "nmcli -t -f ipv4.routes con show '$nmConnName'" 2>&1 | Out-String).Trim()
+                    if ("$nmRoutesAfter" -match $destPat) {
+                        Write-Host "  Persistent route added: '$nmConnName' +ipv4.routes '$Destination/32 via $viaGw'" -ForegroundColor Green
+                        Write-Host "  (existing ipv4.routes entries were preserved)" -ForegroundColor Gray
+                    } else {
+                        Write-Host "  Warning: failed to persist route via NM (runtime route still active)" -ForegroundColor Red
+                    }
+                }
+            }
+        }
+    } elseif ($Destination) {
+        Write-Host "  Route to $Destination is on-link via $outInterface (no gateway hop) - no NM route entry needed" -ForegroundColor Gray
     }
 
     # Step 5: Configure iptables NAT rules
@@ -999,7 +1285,9 @@ function Enable-NAT {
     if ($Destination) { Write-Host "  Destination:    $Destination" -ForegroundColor White }
     Write-Host "  Persisted:      $(if ($Persist) { 'yes' } else { 'no' })" -ForegroundColor White
     Write-Host ""
-    Write-Host "  Traffic flow: Local -> $TargetServer ($inInterface -> $outInterface) -> $Destination" -ForegroundColor Cyan
+    $viaNote = if ($viaGw) { " via $viaGw" } else { "" }
+    $destPart = if ($Destination) { " -> $Destination" } else { " -> external" }
+    Write-Host "  Traffic flow: local($clientIP) -> in:$inInterface -> [NAT out:$outInterface$viaNote]$destPart" -ForegroundColor Cyan
 
     return $true
 }
@@ -1139,6 +1427,386 @@ function Disable-NAT {
     return $true
 }
 
+# Helper: extract an option value from an "iptables -S" rule line ("! -o x" / "-o !x" / "-o x" all handled)
+function Get-RuleOpt {
+    param([string]$Rule, [string]$Opt)
+
+    $m = [regex]::Match($Rule, "(?:^|\s)!\s+$Opt\s+(\S+)")
+    if ($m.Success) { return "!$($m.Groups[1].Value)" }
+    $m = [regex]::Match($Rule, "(?:^|\s)$Opt\s+!(\S+)")
+    if ($m.Success) { return "!$($m.Groups[1].Value)" }
+    $m = [regex]::Match($Rule, "(?:^|\s)$Opt\s+(\S+)")
+    if ($m.Success) { return $m.Groups[1].Value }
+    return ""
+}
+
+# Helper: return $true when a rule positively references an interface absent from the host
+# (negated "!" references and "eth+" wildcards are always considered valid)
+function Test-StaleIface {
+    param([string]$Iface, [string[]]$Existing)
+
+    if (-not $Iface) { return $false }
+    if ($Iface.StartsWith("!")) { return $false }
+    if ($Iface.EndsWith("+")) { return $false }
+    if ($Existing.Count -eq 0) { return $false }
+    return ($Existing -notcontains $Iface)
+}
+
+# Helper: render one "iptables -S" rule line as a compact human-readable string
+function Format-IptablesRuleHuman {
+    param([string]$Rule, [string[]]$ExistingIfaces = @())
+
+    $inIf = Get-RuleOpt -Rule $Rule -Opt "-i"
+    $outIf = Get-RuleOpt -Rule $Rule -Opt "-o"
+    $src = Get-RuleOpt -Rule $Rule -Opt "-s"
+    $dst = Get-RuleOpt -Rule $Rule -Opt "-d"
+    $target = Get-RuleOpt -Rule $Rule -Opt "-j"
+    $state = Get-RuleOpt -Rule $Rule -Opt "--state"
+
+    $parts = @()
+    if ($src -and $src -ne "0.0.0.0/0") { $parts += "src $src" }
+    $parts += "in:$(if ($inIf) { $inIf } else { '*' })"
+    $parts += "out:$(if ($outIf) { $outIf } else { '*' })"
+    if ($dst -and $dst -ne "0.0.0.0/0") { $parts += "dst $dst" }
+    if ($state) { $parts += "state:$state" }
+    if ($target) { $parts += "-> $target" }
+    $line = $parts -join " "
+
+    if ($ExistingIfaces.Count -gt 0) {
+        $stale = @()
+        if (Test-StaleIface -Iface $inIf -Existing $ExistingIfaces) { $stale += $inIf }
+        if (Test-StaleIface -Iface $outIf -Existing $ExistingIfaces) { $stale += $outIf }
+        if ($stale.Count -gt 0) { $line += "  [stale iface: $(($stale | Sort-Object -Unique) -join ', ')]" }
+    }
+    return $line
+}
+
+function Show-NAT {
+    param(
+        [string]$TargetServer,
+        [string]$Destination = "",
+        [string]$DevOverride = "",
+        [switch]$Human
+    )
+
+    Write-Host "`n=== NAT Status on $TargetServer ===" -ForegroundColor Magenta
+
+    # Check if SSH is available
+    $sshCmd = Get-Command ssh -ErrorAction SilentlyContinue
+    if (-not $sshCmd) {
+        Write-Host "Error: SSH client not found. Install OpenSSH client." -ForegroundColor Red
+        return $false
+    }
+
+    # Step 1: Test SSH connection
+    Write-Host "`n[1/4] Testing SSH connection to $TargetServer..." -ForegroundColor Cyan
+    $testResult = ssh -o ConnectTimeout=5 -o BatchMode=yes $TargetServer "echo OK" 2>&1
+    if ($LASTEXITCODE -ne 0 -or "$testResult".Trim() -ne "OK") {
+        Write-Host "  Cannot connect via SSH (requires key-based auth)" -ForegroundColor Red
+        return $false
+    }
+    Write-Host "  SSH connection OK" -ForegroundColor Green
+
+    # Check sudo access (prompt for password if needed)
+    $sudoInfo = Test-SudoAccess -TargetServer $TargetServer
+    if (-not $sudoInfo.Ok) {
+        return $false
+    }
+    $sudoPassword = $sudoInfo.Password
+
+    if ($Human) {
+        # --- Compact human-friendly summary ---
+        $forwardStatus = (ssh $TargetServer "cat /proc/sys/net/ipv4/ip_forward" 2>&1).Trim()
+        $persistConf = (ssh $TargetServer "cat /etc/sysctl.d/99-ipforward.conf 2>/dev/null" 2>$null | Out-String).Trim()
+
+        $sshClient = ssh $TargetServer 'echo $SSH_CLIENT' 2>&1
+        $clientIP = ($sshClient -split ' ')[0]
+        $inInterface = ""
+        if ($clientIP) {
+            $routeIn = ssh $TargetServer "ip route get $clientIP" 2>&1
+            $inInterface = ([regex]::Match("$routeIn", 'dev\s+(\S+)')).Groups[1].Value
+        }
+        # Outbound interface: forced -dev, else -d route lookup, else default route
+        if ($DevOverride) {
+            $outInterface = $DevOverride
+        } elseif ($Destination) {
+            $routeOut = ssh $TargetServer "ip route get $Destination" 2>&1
+            $outInterface = ([regex]::Match("$routeOut", 'dev\s+(\S+)')).Groups[1].Value
+        } else {
+            $defaultRoute = ssh $TargetServer "ip route show default" 2>&1
+            $outInterface = ([regex]::Match("$defaultRoute", 'dev\s+(\S+)')).Groups[1].Value
+        }
+
+        $natRulesS = Invoke-SshSudo -TargetServer $TargetServer -Command "iptables -t nat -S POSTROUTING" -SudoPassword $sudoPassword
+        $fwdRulesS = Invoke-SshSudo -TargetServer $TargetServer -Command "iptables -S FORWARD" -SudoPassword $sudoPassword
+
+        # Interfaces actually present on the host (for stale-rule detection)
+        $ifaceRaw = ssh $TargetServer "ls /sys/class/net" 2>&1
+        $ifaceList = @()
+        if ($LASTEXITCODE -eq 0) {
+            $ifaceList = @(($ifaceRaw -split '\s+') | Where-Object { $_ })
+        }
+
+        $masqLines = @(@($natRulesS) | Where-Object { $_ -match "^-A POSTROUTING" -and $_ -match "MASQUERADE" })
+        $allFwd = @(@($fwdRulesS) | Where-Object { $_ -match "^-A FORWARD" })
+        $fwdLines = @($allFwd | Where-Object { $_ -notmatch "-j DOCKER" })
+        $dockerCount = @($allFwd | Where-Object { $_ -match "-j DOCKER" }).Count
+
+        $fwEnabled = ("$forwardStatus".Trim() -eq "1")
+        $natActive = ($masqLines.Count -gt 0)
+
+        Write-Host "`n=== NAT Summary: $TargetServer ===" -ForegroundColor Magenta
+        Write-Host ""
+        Write-Host "  IP forwarding:  $(if ($fwEnabled) { 'enabled' } else { 'disabled' })$(if ($persistConf) { '  (persistent: yes)' } else { '' })" -ForegroundColor $(if ($fwEnabled) { "Green" } else { "Red" })
+        Write-Host "  NAT status:     $(if ($natActive) { 'ACTIVE' } else { 'INACTIVE (no MASQUERADE rule)' })" -ForegroundColor $(if ($natActive) { "Green" } else { "Red" })
+        if ($inInterface) {
+            Write-Host "  Inbound iface:  $inInterface $(if ($clientIP) { "(local $clientIP)" })" -ForegroundColor White
+        }
+        if ($outInterface) {
+            $outLabel = if ($DevOverride) { "forced via -dev" } elseif ($Destination) { "route to $Destination" } else { "default route" }
+            Write-Host "  Outbound iface: $outInterface ($outLabel)" -ForegroundColor White
+            if ($Destination) {
+                Write-Host "  Route detail:   $("$routeOut".Trim())" -ForegroundColor DarkGray
+            }
+        } elseif ($Destination) {
+            Write-Host "  Outbound iface: (no route to $Destination)" -ForegroundColor Red
+            Write-Host "  Route detail:   $("$routeOut".Trim())" -ForegroundColor DarkGray
+        }
+
+        # NetworkManager route persistence check (same place enable_nat -d writes it)
+        if ($Destination -and $outInterface) {
+            $nmConns = ssh $TargetServer "nmcli -t -f NAME,DEVICE con show --active" 2>&1
+            $nmConnName = ""
+            if ("$nmConns" -notmatch "not found") {
+                foreach ($line in @($nmConns)) {
+                    if ("$line" -match "^(.*):$([regex]::Escape($outInterface))$") { $nmConnName = $Matches[1]; break }
+                }
+            }
+            if ($nmConnName) {
+                $nmRoutes = (ssh $TargetServer "nmcli -t -f ipv4.routes con show '$nmConnName'" 2>&1 | Out-String).Trim()
+                $destPat = "(?<![\d.])" + [regex]::Escape($Destination) + "(?![\d.])"
+                if ("$nmRoutes" -match $destPat) {
+                    Write-Host "  NM route persist: '$nmConnName' ipv4.routes contains $Destination" -ForegroundColor Green
+                } else {
+                    Write-Host "  NM route persist: $Destination NOT in '$nmConnName' ipv4.routes (route won't survive reboot; enable_nat -d will add it)" -ForegroundColor Yellow
+                }
+            } else {
+                Write-Host "  NM route persist: no active NM connection on $outInterface (route comes from docker/manual config)" -ForegroundColor Gray
+            }
+        }
+
+        # Docker bridge verification: does docker0 actually carry containers, and who owns the destination IP
+        if ($ifaceList -contains "docker0") {
+            $dockerPs = Invoke-SshSudo -TargetServer $TargetServer -Command "docker ps --format '{{.Names}} {{.IPAddress}}'" -SudoPassword $sudoPassword
+            if ("$dockerPs" -match "Cannot connect to the Docker daemon|command not found|permission denied|Permission denied") {
+                Write-Host "  Docker check:   unavailable on $TargetServer" -ForegroundColor Gray
+            } else {
+                $dockerLines = @(@($dockerPs) | Where-Object { "$_".Trim() })
+                $withIp = @($dockerLines | Where-Object { "$_" -match "\d+\.\d+\.\d+\.\d+" })
+                if ($dockerLines.Count -eq 0) {
+                    Write-Host "  Docker check:   0 containers running on docker0" -ForegroundColor Yellow
+                } elseif ($withIp.Count -eq 0) {
+                    Write-Host "  Docker check:   $($dockerLines.Count) containers, but IPs not visible (custom networks - verify via docker inspect)" -ForegroundColor Gray
+                } else {
+                    Write-Host "  Docker check:   $($dockerLines.Count) containers: $($dockerLines -join '; ')" -ForegroundColor Gray
+                }
+                if ($Destination -and $withIp.Count -gt 0) {
+                    $owner = @($dockerLines | Where-Object { "$_" -match "(?<![\d.])$([regex]::Escape($Destination))(?![\d.])" })
+                    if ($owner.Count -gt 0) {
+                        Write-Host "  Docker target:  $Destination is owned by $($owner -join ', ')" -ForegroundColor Green
+                    } else {
+                        Write-Host "  Docker target:  $Destination NOT owned by any container (traffic to it would die on the bridge)" -ForegroundColor Red
+                    }
+                }
+            }
+        }
+
+        Write-Host "`n  NAT rules (POSTROUTING):" -ForegroundColor Yellow
+        if ($natActive) {
+            $i = 1
+            foreach ($r in $masqLines) {
+                $src = Get-RuleOpt -Rule $r -Opt "-s"
+                $outIf = Get-RuleOpt -Rule $r -Opt "-o"
+                if (-not $src) { $src = "any source" }
+                if (Test-StaleIface -Iface $outIf -Existing $ifaceList) {
+                    Write-Host "    $i. $src -> via $outIf  (MASQUERADE)  [stale iface: $outIf]" -ForegroundColor Yellow
+                } else {
+                    Write-Host "    $i. $src -> via $outIf  (MASQUERADE)" -ForegroundColor Gray
+                }
+                $i++
+            }
+        } else {
+            Write-Host "    (none)" -ForegroundColor Red
+        }
+
+        Write-Host "`n  FORWARD rules:" -ForegroundColor Yellow
+        $policy = ([regex]::Match((@($fwdRulesS) -join "`n"), '(?m)^-P FORWARD (\S+)')).Groups[1].Value
+        if ($policy) {
+            Write-Host "    default policy: $policy" -ForegroundColor Gray
+        }
+        if ($fwdLines.Count -gt 0) {
+            $i = 1
+            foreach ($r in $fwdLines) {
+                $ruleText = Format-IptablesRuleHuman -Rule $r -ExistingIfaces $ifaceList
+                if ("$ruleText" -match "\[stale iface") {
+                    Write-Host "    $i. $ruleText" -ForegroundColor Yellow
+                } else {
+                    Write-Host "    $i. $ruleText" -ForegroundColor Gray
+                }
+                $i++
+            }
+        } else {
+            Write-Host "    (none)" -ForegroundColor Red
+        }
+        if ($dockerCount -gt 0) {
+            Write-Host "    (+ $dockerCount docker-related rules hidden)" -ForegroundColor DarkGray
+        }
+
+        # Summarize rules referencing interfaces that no longer exist
+        $staleAll = @()
+        foreach ($r in @($masqLines + $fwdLines)) {
+            foreach ($opt in @("-i", "-o")) {
+                $v = Get-RuleOpt -Rule $r -Opt $opt
+                if (Test-StaleIface -Iface $v -Existing $ifaceList) { $staleAll += $v }
+            }
+        }
+        $staleAll = @($staleAll | Sort-Object -Unique)
+        if ($staleAll.Count -gt 0) {
+            Write-Host "`n  Warning: rules reference non-existent interfaces: $($staleAll -join ', ') (leftover config, safe to clean up)" -ForegroundColor Yellow
+        }
+
+        # Traffic flows: -d specific path first, then one per MASQUERADE rule
+        $flows = @()
+        if ($Destination -and $outInterface) {
+            $viaGw = ""
+            if ($routeOut) { $viaGw = ([regex]::Match("$routeOut", 'via\s+(\S+)')).Groups[1].Value }
+            $gwPart = if ($viaGw) { " via $viaGw" } else { "" }
+            $inPart = if ($inInterface) { "in:$inInterface -> " } else { "" }
+            $lastHop = if ($outInterface -eq "docker0" -or $outInterface -match "^(docker|br-)") { "container($Destination)" } else { $Destination }
+            $flows += "to ${Destination}: local($clientIP) -> $inPart[NAT out:$outInterface$gwPart] -> $lastHop"
+        }
+        foreach ($r in $masqLines) {
+            $src = Get-RuleOpt -Rule $r -Opt "-s"
+            $outIf = Get-RuleOpt -Rule $r -Opt "-o"
+            if (-not $src) { $src = "any source" }
+            if (-not $outIf -or $outIf -eq "*") { continue }
+            if ($outIf -match "^!") {
+                $flows += "$src -> [NAT out:any iface except $($outIf.TrimStart('!'))] -> external"
+            } else {
+                $lastHop = if ($outIf -match "^(docker|br-)") { "docker containers (hairpin SNAT)" } else { "external" }
+                $flows += "$src -> [NAT out:$outIf] -> $lastHop"
+            }
+        }
+        $flows = @($flows | Select-Object -Unique)
+        if ($flows.Count -gt 0) {
+            Write-Host "`n  Traffic flows:" -ForegroundColor Cyan
+            $i = 1
+            foreach ($f in $flows) { Write-Host "    $i. $f" -ForegroundColor White; $i++ }
+        } elseif ($fwEnabled -and $natActive -and $inInterface -and $outInterface) {
+            $lastHop = if ($outInterface -eq "docker0" -and $Destination) { "container($Destination)" } else { "external" }
+            Write-Host "`n  Traffic flow: local($clientIP) -> $inInterface -> [NAT] -> $outInterface -> $lastHop" -ForegroundColor Cyan
+        }
+
+        $pkgCheck = ssh $TargetServer "dpkg -l iptables-persistent 2>/dev/null | grep -q '^ii' && echo INSTALLED || echo NOT_INSTALLED" 2>&1
+        if ("$pkgCheck".Trim() -eq "INSTALLED") {
+            $savedFile = (ssh $TargetServer "test -s /etc/iptables/rules.v4 && echo SAVED || echo NO_SAVE" 2>&1 | Out-String).Trim()
+            if ("$savedFile" -eq "SAVED") {
+                Write-Host "  Persistence:  saved to /etc/iptables/rules.v4 (survives reboot)" -ForegroundColor Green
+            } else {
+                Write-Host "  Persistence:  iptables-persistent installed, but no rules saved yet" -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "  Persistence:  not installed (rules lost after reboot)" -ForegroundColor Gray
+        }
+
+        return $true
+    }
+
+    # Step 2: IP forwarding status
+    Write-Host "`n[2/4] IP forwarding status..." -ForegroundColor Cyan
+    $forwardStatus = (ssh $TargetServer "cat /proc/sys/net/ipv4/ip_forward" 2>&1).Trim()
+    if ($forwardStatus -eq "1") {
+        Write-Host "  net.ipv4.ip_forward = 1 (enabled)" -ForegroundColor Green
+    } elseif ($forwardStatus -eq "0") {
+        Write-Host "  net.ipv4.ip_forward = 0 (disabled)" -ForegroundColor Red
+    } else {
+        Write-Host "  net.ipv4.ip_forward = $forwardStatus (unknown)" -ForegroundColor Yellow
+    }
+    $persistConf = (ssh $TargetServer "cat /etc/sysctl.d/99-ipforward.conf 2>/dev/null" 2>$null | Out-String).Trim()
+    if ($persistConf) {
+        Write-Host "  Persistent: /etc/sysctl.d/99-ipforward.conf -> $($persistConf -split "`n" | Select-Object -First 1)" -ForegroundColor Green
+    } else {
+        Write-Host "  Persistent: /etc/sysctl.d/99-ipforward.conf not found" -ForegroundColor Gray
+    }
+
+    # Step 3: Interface context (same detection logic as enable_nat, honors -d)
+    Write-Host "`n[3/4] Interface context..." -ForegroundColor Cyan
+    $sshClient = ssh $TargetServer 'echo $SSH_CLIENT' 2>&1
+    $clientIP = ($sshClient -split ' ')[0]
+    if ($clientIP) {
+        $routeIn = ssh $TargetServer "ip route get $clientIP" 2>&1
+        $inInterface = ([regex]::Match("$routeIn", 'dev\s+(\S+)')).Groups[1].Value
+        if ($inInterface) {
+            Write-Host "  Inbound (SSH session):  $inInterface (local IP $clientIP)" -ForegroundColor White
+        }
+    }
+    if ($DevOverride) {
+        $outInterface = $DevOverride
+        Write-Host "  Outbound (forced -dev): $outInterface" -ForegroundColor White
+    } elseif ($Destination) {
+        $routeOut = ssh $TargetServer "ip route get $Destination" 2>&1
+        $outInterface = ([regex]::Match("$routeOut", 'dev\s+(\S+)')).Groups[1].Value
+        if ($outInterface) {
+            Write-Host "  Outbound (to $Destination): $outInterface" -ForegroundColor White
+            Write-Host "  Route detail: $("$routeOut".Trim())" -ForegroundColor Gray
+        } else {
+            Write-Host "  Outbound: no route to $Destination" -ForegroundColor Red
+            Write-Host "  Route detail: $("$routeOut".Trim())" -ForegroundColor Gray
+        }
+    } else {
+        $defaultRoute = ssh $TargetServer "ip route show default" 2>&1
+        $outInterface = ([regex]::Match("$defaultRoute", 'dev\s+(\S+)')).Groups[1].Value
+        if ($outInterface) {
+            Write-Host "  Outbound (default):     $outInterface" -ForegroundColor White
+        }
+    }
+
+    # Step 4: iptables rules (NAT table + FORWARD chain)
+    Write-Host "`n[4/4] iptables rules..." -ForegroundColor Cyan
+
+    $natRules = Invoke-SshSudo -TargetServer $TargetServer -Command "iptables -t nat -L POSTROUTING -n -v --line-numbers" -SudoPassword $sudoPassword
+    Write-Host "`n  === NAT table: POSTROUTING chain ===" -ForegroundColor Yellow
+    foreach ($line in @($natRules)) {
+        if ("$line".Trim()) { Write-Host "  $line" -ForegroundColor Gray }
+    }
+    if ("$natRules" -match "MASQUERADE") {
+        Write-Host "  NAT (MASQUERADE) is ACTIVE" -ForegroundColor Green
+    } else {
+        Write-Host "  No MASQUERADE rule found (NAT inactive)" -ForegroundColor Red
+    }
+
+    $fwdRules = Invoke-SshSudo -TargetServer $TargetServer -Command "iptables -L FORWARD -n -v --line-numbers" -SudoPassword $sudoPassword
+    Write-Host "`n  === Filter table: FORWARD chain ===" -ForegroundColor Yellow
+    foreach ($line in @($fwdRules)) {
+        if ("$line".Trim()) { Write-Host "  $line" -ForegroundColor Gray }
+    }
+
+    # Persistence info
+    $pkgCheck = ssh $TargetServer "dpkg -l iptables-persistent 2>/dev/null | grep -q '^ii' && echo INSTALLED || echo NOT_INSTALLED" 2>&1
+    if ("$pkgCheck".Trim() -eq "INSTALLED") {
+        $savedFile = (ssh $TargetServer "test -s /etc/iptables/rules.v4 && echo SAVED || echo NO_SAVE" 2>&1 | Out-String).Trim()
+        if ("$savedFile" -eq "SAVED") {
+            Write-Host "`n  iptables-persistent: installed, saved rules /etc/iptables/rules.v4 present" -ForegroundColor White
+        } else {
+            Write-Host "`n  iptables-persistent: installed, no rules saved yet" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "`n  iptables-persistent: not installed (rules will not survive reboot)" -ForegroundColor Gray
+    }
+
+    return $true
+}
+
 # === Command handlers (must be after all function definitions) ===
 
 if ($Command -eq "set_ics") {
@@ -1158,9 +1826,10 @@ if ($Command -eq "set_ics") {
 
 if ($Command -eq "enable_nat") {
     if (-not $AdapterArg) {
-        Write-Host "Error: Usage: .\ip.ps1 enable_nat <target_server> [-d <destination>] [-Persist]" -ForegroundColor Red
+        Write-Host "Error: Usage: .\ip.ps1 enable_nat <target_server> [-d <destination>] [-dev <iface>] [-Persist]" -ForegroundColor Red
         Write-Host "  target_server: SSH target (e.g., 192.168.137.2 or user@192.168.137.2)" -ForegroundColor Yellow
         Write-Host "  -d <dest>:     Destination IP to route through (e.g., 172.17.1.122)" -ForegroundColor Yellow
+        Write-Host "  -dev <iface>:  Force outbound interface; AUTO = auto-select by ping test; omit = asked when route fails" -ForegroundColor Yellow
         Write-Host "  -Persist:      Save rules across reboot" -ForegroundColor Yellow
         Write-Host "  -p 1:          Alternative for -Persist" -ForegroundColor Yellow
         exit 1
@@ -1170,7 +1839,7 @@ if ($Command -eq "enable_nat") {
     $destination = $NatDest
     $shouldPersist = $Persist -or (-not [string]::IsNullOrWhiteSpace($ProfileNum))
 
-    if (Enable-NAT -TargetServer $targetServer -Destination $destination -Persist:$shouldPersist) {
+    if (Enable-NAT -TargetServer $targetServer -Destination $destination -DevInterface $DevInterface -Persist:$shouldPersist) {
         Write-Host "`nDone!" -ForegroundColor Green
     } else {
         Write-Host "`nFailed to enable NAT" -ForegroundColor Red
@@ -1202,11 +1871,30 @@ if ($Command -eq "disable_nat") {
     exit 0
 }
 
+if ($Command -eq "show_nat") {
+    if (-not $AdapterArg) {
+        Write-Host "Error: Usage: .\ip.ps1 show_nat <target_server> [-d <dest>] [-dev <iface>] [-h]" -ForegroundColor Red
+        Write-Host "  target_server: SSH target (e.g., 192.168.137.2 or user@192.168.137.2)" -ForegroundColor Yellow
+        Write-Host "  -d <dest>:     Outbound interface detected via route to <dest> (same as enable_nat)" -ForegroundColor Yellow
+        Write-Host "  -dev <iface>:  Force outbound interface display (same as enable_nat -dev)" -ForegroundColor Yellow
+        Write-Host "  -h:            Human-friendly summary (recommended)" -ForegroundColor Yellow
+        Write-Host "  (no -h):       Raw detail: ip_forward, iptables NAT/FORWARD listings, persistence" -ForegroundColor Yellow
+        exit 1
+    }
+
+    if (-not (Show-NAT -TargetServer $AdapterArg -Destination $NatDest -DevOverride $DevInterface -Human:$Human)) {
+        exit 1
+    }
+    exit 0
+}
+
 if (-not $ProfileNum) {
     Show-AllAdapters
     Show-RoutingTable
     
     Write-Host "`n========================================" -ForegroundColor Magenta
+    $editTime = (Get-Item $PSCommandPath).LastWriteTime.ToString("yyyy-MM-dd HH:mm")
+    Write-Host "ip.ps1 v$ScriptVersion (edited $editTime)" -ForegroundColor DarkGray
     Write-Host "Usage:" -ForegroundColor Yellow
     Write-Host "  .\ip.ps1                              Show all network info" -ForegroundColor White
     Write-Host "  .\ip.ps1 ping [target]                Test network connectivity" -ForegroundColor White
@@ -1216,8 +1904,10 @@ if (-not $ProfileNum) {
     Write-Host "  .\ip.ps1 set_profile <1|2|3> [adapter] Apply network profile" -ForegroundColor White
     Write-Host "  .\ip.ps1 trace_route <target>         Trace route to target" -ForegroundColor White
     Write-Host "  .\ip.ps1 set_ip <adapter> <ip> [mask] Set static IP freely (requires admin)" -ForegroundColor White
-    Write-Host "  .\ip.ps1 enable_nat <server> [-d <dest>] [-Persist]  Enable NAT on remote Linux (via SSH)" -ForegroundColor White
+    Write-Host "  .\ip.ps1 enable_nat <server> [-d <dest>] [-dev <if|AUTO>] [-Persist]  Enable NAT (route verified by ping)" -ForegroundColor White
     Write-Host "  .\ip.ps1 disable_nat <server> [-d <dest>] [-Persist] Disable NAT on remote Linux (via SSH)" -ForegroundColor White
+    Write-Host "  .\ip.ps1 show_nat <server> [-d <dest>] [-h]  Show NAT/forwarding status (-h = simple summary)" -ForegroundColor White
+    Write-Host "  .\ip.ps1 version                      Show script version info (edited time + git commit)" -ForegroundColor White
     Write-Host ""
     Write-Host "Profiles:" -ForegroundColor Cyan
     Write-Host "  Profile 1: Static IP (192.168.137.1/24, DHCP DNS)" -ForegroundColor Gray
